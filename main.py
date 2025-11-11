@@ -1,10 +1,11 @@
 # main.py (simplified unified batch translation workflow)
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional
 import uvicorn
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from graph import build_graph_terms_only
-from typing import List, Dict, Any
 import logging
 import time
 import re
@@ -23,14 +24,16 @@ except Exception as e:
     WORKFLOW_TERMS_ONLY = None
 
 
-def process_chunk_terms_only(chunk: Dict[str, Any], summary: str) -> Dict[str, Any]:
-    """运行术语提取（不翻译），返回 {chunk_id, terms, term_types, error?}"""
-    if not isinstance(chunk, dict) or len(chunk) != 1:
+def process_chunk_terms_only(chunk_id: str, chunk_text: Any, summary: str) -> Dict[str, Any]:
+    """运行术语提取（不翻译），返回 {chunk_id, terms, term_types, error?}
+
+    现在接受 chunk_id 和 chunk_text 分别作为参数，以便支持 ExtractPayload.chunks 为 Dict[str,str]
+    """
+    if chunk_id is None:
         return {"chunk_id": None, "terms": [], "term_types": {}, "error": "malformed_chunk"}
     if WORKFLOW_TERMS_ONLY is None:
-        return {"chunk_id": next(iter(chunk.keys())), "terms": [], "term_types": {}, "error": "terms_only_workflow_not_initialized"}
+        return {"chunk_id": str(chunk_id), "terms": [], "term_types": {}, "error": "terms_only_workflow_not_initialized"}
 
-    chunk_id, chunk_text = next(iter(chunk.items()))
     text = chunk_text if isinstance(chunk_text, str) else str(chunk_text)
 
     init_state = {
@@ -67,37 +70,28 @@ async def root():
     return {"status": "ok", "terms_only_initialized": WORKFLOW_TERMS_ONLY is not None}
 
 
+class ExtractPayload(BaseModel):
+    summary: Optional[str] = Field("", description="主题/上下文，可选")
+    chunks: Dict[str, str] = Field(..., description="列表，每项为单个键值对：{id: text}")
+
 @app.post("/extract")
-async def extract(request: Request):
+async def extract(payload: ExtractPayload):
     """
-    统一翻译模式：
+    统一翻译模式（现在使用 Pydantic 模型作为请求体）：
     1) 并行处理每段，提取术语（不翻译）
     2) 汇总全部唯一术语，一次性批量翻译
     3) 将翻译结果按每段术语映射回去并返回注释
-
-    输入 JSON:
-    {
-      "summary": "...",  # 主题/上下文（可选提升术语筛选质量）
-      "chunks": [ {"1": "段落1"}, {"2": "段落2"}, ... ]
-    }
-    输出字段 termAnnotations 与之前保持一致。
     """
-    try:
-        payload = await request.json()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"invalid json: {e}")
-
-    summary = payload.get("summary", "")
-    chunks = payload.get("chunks", [])
-    if not isinstance(chunks, list):
-        raise HTTPException(status_code=400, detail="chunks must be a list of {id: text} objects")
+    summary = payload.summary or ""
+    chunks = payload.chunks
 
     # 1) 并行术语提取
     per_chunk_results: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
     start_ts = time.time()
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(process_chunk_terms_only, chunk, summary) for chunk in chunks]
+        # chunks is now a Dict[str, str], iterate items and pass id/text separately
+        futures = [executor.submit(process_chunk_terms_only, cid, ctext, summary) for cid, ctext in chunks.items()]
         for f in as_completed(futures):
             r = f.result()
             if not r:
@@ -171,4 +165,4 @@ async def extract(request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8007, reload=False)
