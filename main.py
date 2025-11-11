@@ -10,7 +10,7 @@ import logging
 import time
 import re
 from utils.Get_term import get_translation_candidates_batch, translate_term as translate_term_external
-from utils.db_interface import query_term_translation
+from utils.db_interface import query_term_translation, ensure_db_initialized
 
 app = FastAPI(title="Term Extraction API")
 logger = logging.getLogger(__name__)
@@ -18,6 +18,11 @@ logging.basicConfig(level=logging.INFO)
 
 # Initialize only the terms-only workflow (extraction without translation)
 try:
+    # Try to ensure database and table exist, but don't crash startup if DB is unreachable
+    try:
+        ensure_db_initialized()
+    except Exception as db_e:
+        logger.warning("Database initialization failed at startup: %s", db_e)
     WORKFLOW_TERMS_ONLY = build_graph_terms_only()
 except Exception as e:
     logger.exception("Failed to build terms-only graph at startup: %s", e)
@@ -131,10 +136,11 @@ async def extract(payload: ExtractPayload):
                 pass
         translations_map[t] = single or []
 
-    # 4) 按分段组装结果
-    term_annotations: List[Dict[str, Any]] = []
+    # 4) 按分段组装结果为对象映射: {chunk_id: {"term": {term:trans,..}, "proper_noun": {...}}}
+    term_annotations: Dict[str, Any] = {}
+    translated_count = 0
     for r in per_chunk_results:
-        cid = r.get("chunk_id")
+        cid = str(r.get("chunk_id"))
         term_types = r.get("term_types", {}) or {}
         final_translations: Dict[str, str] = {}
         for t in r.get("terms", []):
@@ -142,25 +148,34 @@ async def extract(payload: ExtractPayload):
             chosen = pick_best_translation(cands)
             if chosen:
                 final_translations[t] = chosen
-        term_list = []
-        pn_list = []
+
+        term_map: Dict[str, str] = {}
+        pn_map: Dict[str, str] = {}
         for term, trans in final_translations.items():
             ttype = term_types.get(term, "term")
-            entry = {term: trans}
             if ttype == "proper_noun":
-                pn_list.append(entry)
+                pn_map[term] = trans
             else:
-                term_list.append(entry)
-        term_annotations.append({cid: [{"term": term_list}, {"proper_noun": pn_list}]})
+                term_map[term] = trans
+
+        if term_map or pn_map:
+            term_annotations[cid] = {"term": term_map, "proper_noun": pn_map}
+            translated_count += len(term_map) + len(pn_map)
+        else:
+            # per your example, empty chunk entry should be an empty object
+            term_annotations[cid] = {}
+
+    # Attach stats inside termAnnotations object per requested format
+    stats = {
+        "total_chunks": len(chunks),
+        "unique_terms": len(unique_terms),
+        "translated_terms": translated_count,
+    }
+    term_annotations["stats"] = stats
 
     resp = {"termAnnotations": term_annotations}
     if errors:
         resp["errors"] = errors
-    resp["stats"] = {
-        "total_chunks": len(chunks),
-        "unique_terms": len(unique_terms),
-        "translated_terms": sum(len(x[list(x.keys())[0]][0]["term"]) + len(x[list(x.keys())[0]][1]["proper_noun"]) for x in term_annotations) if term_annotations else 0
-    }
     return JSONResponse(resp)
 
 
