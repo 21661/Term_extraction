@@ -94,7 +94,7 @@ async def extract(payload: ExtractPayload):
     per_chunk_results: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
     start_ts = time.time()
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=20) as executor:
         # chunks is now a Dict[str, str], iterate items and pass id/text separately
         futures = [executor.submit(process_chunk_terms_only, cid, ctext, summary) for cid, ctext in chunks.items()]
         for f in as_completed(futures):
@@ -115,7 +115,25 @@ async def extract(payload: ExtractPayload):
     # 3) 批量翻译
     translations_map: Dict[str, List[str]] = {}
     try:
-        translations_map = get_translation_candidates_batch(unique_terms) or {}
+        if unique_terms:
+            batch_size = 50
+            batches = [unique_terms[i:i + batch_size] for i in range(0, len(unique_terms), batch_size)]
+            max_workers = 5
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(get_translation_candidates_batch, batch, batch_size=batch_size): idx
+                    for idx, batch in enumerate(batches)
+                }
+                for f in as_completed(future_to_idx):
+                    idx = future_to_idx[f]
+                    try:
+                        res = f.result() or {}
+                        if isinstance(res, dict):
+                            translations_map.update(res)
+                        else:
+                            logger.warning("Batch %d returned non-dict result, ignored", idx)
+                    except Exception as e:
+                        logger.warning("Batch translation failed for batch %d: %s", idx, e)
     except Exception as e:
         logger.warning("Batch translation failed, will fallback to single + db: %s", e)
         translations_map = {}
@@ -171,13 +189,14 @@ async def extract(payload: ExtractPayload):
         "unique_terms": len(unique_terms),
         "translated_terms": translated_count,
     }
-    term_annotations["stats"] = stats
 
-    resp = {"termAnnotations": term_annotations}
+
+    resp = {"termAnnotations": term_annotations,"stats":stats}
     if errors:
         resp["errors"] = errors
+    logger.warning("Extraction completed cost Time %.2fs", time.time() - start_ts)
     return JSONResponse(resp)
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8007, reload=False)
+    uvicorn.run("main:app", host="127.0.0.1", port=8007, reload=False)

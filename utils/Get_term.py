@@ -2,7 +2,7 @@
 # CLI helper for querying/translating terms (uses utils package imports)
 from typing import List, Dict
 from utils.db_interface import query_term_translation, save_translation
-from utils.web_fetcher import fetch_core_translations
+#from utils.web_fetcher import fetch_core_translations
 from utils.zhipu_client import client
 import logging
 import re
@@ -36,18 +36,18 @@ def translate_term_Dict(term_en):
     else:
         print("本地库未找到翻译")
 
-    # 2. 网络抓取
-    candidates = fetch_core_translations(term_en)
-    if not candidates:
-        print("网络抓取未找到翻译")
-        return []
-
-    # 3. 人工确认
-    term_cn = select_candidate(candidates)
-    if term_cn:
-        save_translation(term_en, term_cn)
-        print(f"已保存翻译：{term_cn}")
-        return [term_cn]
+    # # 2. 网络抓取
+    # candidates = fetch_core_translations(term_en)
+    # if not candidates:
+    #     print("网络抓取未找到翻译")
+    #     return []
+    #
+    # # 3. 人工确认
+    # term_cn = select_candidate(candidates)
+    # if term_cn:
+    #     save_translation(term_en, term_cn)
+    #     print(f"已保存翻译：{term_cn}")
+    #     return [term_cn]
 
     return []
 
@@ -76,11 +76,14 @@ def _fetch_llm_translation(term: str, retries=2, backoff=1.0) -> List[str]:
     for attempt in range(1, retries + 1):
         try:
             completion = client.chat.completions.create(
-                model="glm-4.5",
+                model="glm-4-FlashX-250414",
                 messages=[
                     {"role": "system", "content": "你是专业术语翻译助手"},
                     {"role": "user", "content": prompt},
                 ],
+                # thinking={
+                #     "type": "disabled",
+                # },
                 temperature=0.2,
             )
 
@@ -108,11 +111,14 @@ def _fetch_llm_translation_batch(terms: list[str], retries=2, backoff=1.0) -> di
     for attempt in range(1, retries + 1):
         try:
             completion = client.chat.completions.create(
-                model="glm-4.5",
+                model="glm-4-FlashX-250414",
                 messages=[
                     {"role": "system", "content": "你是专业术语翻译助手"},
                     {"role": "user", "content": prompt},
                 ],
+                # thinking={
+                #     "type": "disabled",
+                # },
                 temperature=0.2,
             )
             raw_text = _extract_completion_text(completion)
@@ -144,19 +150,7 @@ def _get_translation_candidates(term: str) -> List[str]:
     method = _decide_translation_method(term)
     candidates = []
 
-    if method == "dict":
-        candidates = fetch_core_translations(term)
-        if not candidates:
-            candidates = _fetch_llm_translation(term)
-    elif method == "llm":
-        candidates = _fetch_llm_translation(term)
-        if not candidates:
-            try:
-                logger.info("LLM 未返回候选，回退到抓取字典: %s", term)
-                candidates = fetch_core_translations(term)
-            except Exception as _e:
-                logger.debug("回退抓取失败: %s", _e)
-
+    candidates = _fetch_llm_translation(term)
     # 去重
     seen = set()
     cleaned: List[str] = []
@@ -167,40 +161,36 @@ def _get_translation_candidates(term: str) -> List[str]:
             cleaned.append(c_clean)
     return cleaned
 
-def get_translation_candidates_batch(terms: list[str]) -> dict[str, list[str]]:
+def get_translation_candidates_batch(terms: list[str], batch_size: int = 50) -> dict[str, list[str]]:
     """
-    批量获取翻译候选。
+    批量获取翻译候选（带分批机制）。
     1️⃣ 先查本地库
     2️⃣ 收集需要 LLM 批量翻译的词
-    3️⃣ 批量调用 LLM
+    3️⃣ 分批调用 LLM，避免请求过大
     """
-    result = {}
-    llm_terms = []
+    result: dict[str, list[str]] = {}
+    llm_terms: list[str] = []
 
+    # Step 1: 查询本地翻译
     for term in terms:
         local = query_term_translation(term)
         if local:
             result[term] = local
         else:
-            method = _decide_translation_method(term)
-            if method == "dict":
-                candidates = fetch_core_translations(term)
-                if not candidates:
-                    llm_terms.append(term)
-                else:
-                    result[term] = candidates
-            else:
-                llm_terms.append(term)
+            llm_terms.append(term)
 
+    # Step 2: 分批调用 LLM
     if llm_terms:
-        llm_results = _fetch_llm_translation_batch(llm_terms)
-        for term, candidates in llm_results.items():
-            result[term] = candidates
+        for i in range(0, len(llm_terms), batch_size):
+            batch = llm_terms[i:i + batch_size]
+            llm_results = _fetch_llm_translation_batch(batch)
+            for term, candidates in llm_results.items():
+                result[term] = candidates
 
-    # 清理去重
+    # Step 3: 清理去重
     for term, candidates in result.items():
-        seen = set()
-        cleaned = []
+        cleaned: list[str] = []
+        seen: set[str] = set()
         for c in candidates:
             c_clean = c.strip()
             if c_clean and c_clean not in seen:
@@ -284,3 +274,4 @@ def _extract_completion_text(completion) -> str:
             return str(completion)
         except Exception:
             return ""
+

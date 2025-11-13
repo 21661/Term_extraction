@@ -55,7 +55,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # 可调参数
-_MAX_TERMS_TO_PROCESS = 6  # 目标提取 5-6 个术语（最大候选数）
+_MAX_TERMS_TO_PROCESS = 10  # 目标提取 5-6 个术语（最大候选数）
 _LLM_RETRIES = 2
 _RETRY_BACKOFF = 1.0
 _NOISE_MIN_CHAR = 2
@@ -118,8 +118,11 @@ def _cached_llm_completion(prompt: str, system: str = "你是术语分类助手"
     LLM_CALLS += 1
     try:
         completion = client.chat.completions.create(
-            model="glm-4.5",
+            model="glm-4-FlashX-250414",
             messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            # thinking={
+            #     "type": "disabled",
+            # },
             temperature=0,
         )
         return _safe_extract_completion_content(completion)
@@ -382,11 +385,10 @@ def filter_terms(state: typing.Any) -> TermState:
 约束与规则（务必遵守）：
 只从候选列表中选择候选项，且必须按候选列表中的原样文本返回（不要改写候选文本的字面形式）。不要创造新术语或拼写变体；如果候选里存在同义或重复项只保留一次。
 分类说明：
-"term"：学术/技术术语、理论概念常见的学术/工程术语
-"proper_noun"：专有名词、算法名、模型名、库/框架名、数据集名称、公司/组织名、产品名、明确的缩写或首字母缩写
-长度限制：所选短语长度（以词为单位）不应超过 4–5 个单词。超过该长度的候选请排除，除非它明显为一个已命名的专有名（仍应放在 proper_noun 中）。
+"term"：学术/技术术语、
+"proper_noun"：专有名词、算法名、明确的缩写或首字母缩写
+长度限制：所选短语长度（以词为单位）不应超过 4–5 个单词。超过该长度的候选请排除，除非它明显为一个已命名的专有名，
 严格排除：不要选择明显的普通词或无意义短语，例如 "data", "set", "vector", "each example", "the method", "this paper" 等。若候选仅是停用词/代词/短泛词，应排除。
-数量与去重：每个分类内部去重（不重复返回同一字符串）
 输出要求：
 必须返回合法可 parse 的 JSON，仅此一行或紧凑 JSON（不允许多行文本/人类说明）。
 """
