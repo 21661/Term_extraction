@@ -1,30 +1,15 @@
 # utils/Get_term.py
 # CLI helper for querying/translating terms (uses utils package imports)
-from typing import List, Dict
-from utils.db_interface import query_term_translation, save_translation
-#from utils.web_fetcher import fetch_core_translations
-from utils.zhipu_client import client
+import json
+from typing import List, Dict, Optional
+from utils.db_interface import query_term_translation
+# from utils.web_fetcher import fetch_core_translations
+from utils.zhipu_client import client,DJ_client
 import logging
 import re
 import time
 
 logger = logging.getLogger(__name__)
-
-def select_candidate(candidates):
-    """人工选择候选翻译"""
-    if not candidates:
-        return None
-    print("抓取到候选翻译：")
-    for idx, c in enumerate(candidates, 1):
-        print(f"{idx}. {c}")
-    choice = input("请选择翻译序号(默认第一个)或直接回车: ")
-    try:
-        idx = int(choice) - 1
-        if 0 <= idx < len(candidates):
-            return candidates[idx]
-    except Exception:
-        pass
-    return candidates[0]
 
 def translate_term_Dict(term_en):
     # 单DIct翻译
@@ -35,21 +20,8 @@ def translate_term_Dict(term_en):
         return local
     else:
         print("本地库未找到翻译")
-
-    # # 2. 网络抓取
-    # candidates = fetch_core_translations(term_en)
-    # if not candidates:
-    #     print("网络抓取未找到翻译")
-    #     return []
-    #
-    # # 3. 人工确认
-    # term_cn = select_candidate(candidates)
-    # if term_cn:
-    #     save_translation(term_en, term_cn)
-    #     print(f"已保存翻译：{term_cn}")
-    #     return [term_cn]
-
     return []
+
 
 def translate_terms_Dict(terms: List[str]) -> Dict[str, List[str]]:
     result = {}
@@ -57,159 +29,28 @@ def translate_terms_Dict(terms: List[str]) -> Dict[str, List[str]]:
         result[term] = translate_term_Dict(term)
     return result
 
+
 def _normalize_term(term: str) -> str:
     return term.strip().lower()
 
+
 def _decide_translation_method(term: str) -> str:
-    """自动判断使用字典还是 LLM"""
+    """
+    自动判断使用字典还是 LLM
+    """
     term_norm = _normalize_term(term)
 
     if len(term_norm) <= 2:
         return "dict"
-    if len(term.split()) > 1 or re.search(r"[-_/]", term):
+    if len(term.split()) > 1 or re.search(r"[-_\/]", term):
         return "llm"
     return "dict"
 
-def _fetch_llm_translation(term: str, retries=2, backoff=1.0) -> List[str]:
-    """使用 LLM 获取翻译候选"""
-    prompt = f'请将下列英文学术/技术术语翻译成中文，保持专业性：\n"{term}"\n请返回中文列表，用逗号或换行分隔。'
-    for attempt in range(1, retries + 1):
-        try:
-            completion = client.chat.completions.create(
-                model="glm-4-FlashX-250414",
-                messages=[
-                    {"role": "system", "content": "你是专业术语翻译助手"},
-                    {"role": "user", "content": prompt},
-                ],
-                # thinking={
-                #     "type": "disabled",
-                # },
-                temperature=0.2,
-            )
-
-            raw_text = _extract_completion_text(completion)
-            if raw_text:
-                candidates = [t.strip() for t in re.split(r"[,\n，、；;]", raw_text) if t.strip()]
-                return candidates
-
-        except Exception as e:
-            logger.warning("LLM 翻译失败 (attempt %d) for term %s: %s", attempt, term, e)
-            time.sleep(backoff * attempt)
-    return []
-
-def _fetch_llm_translation_batch(terms: list[str], retries=2, backoff=1.0) -> dict[str, list[str]]:
-    """
-    批量调用 LLM 翻译多个术语
-    返回 dict: {term: [候选翻译列表]}
-    """
-    if not terms:
-        return {}
-
-    prompt = "请将下列英文学术/技术术语翻译成中文，保持专业性，每个术语给出一个或多个翻译候选，用换行分隔，格式为 term: 翻译1, 翻译2\n\n"
-    prompt += "\n".join(terms)
-
-    for attempt in range(1, retries + 1):
-        try:
-            completion = client.chat.completions.create(
-                model="glm-4-FlashX-250414",
-                messages=[
-                    {"role": "system", "content": "你是专业术语翻译助手"},
-                    {"role": "user", "content": prompt},
-                ],
-                # thinking={
-                #     "type": "disabled",
-                # },
-                temperature=0.2,
-            )
-            raw_text = _extract_completion_text(completion)
-            if not raw_text:
-                continue
-
-            result: dict[str, list[str]] = {}
-            for line in raw_text.splitlines():
-                if ":" in line:
-                    term, translations = line.split(":", 1)
-                    term = term.strip()
-                    candidates = [t.strip() for t in re.split(r"[,\n，、；;]", translations) if t.strip()]
-                    result[term] = candidates
-            return result
-        except Exception as e:
-            logger.warning("LLM 批量翻译失败 (attempt %d): %s", attempt, e)
-            time.sleep(backoff * attempt)
-    return {term: [] for term in terms}
-
-def _get_translation_candidates(term: str) -> List[str]:
-    # 完善的翻译模块
-    # 1️⃣ 尝试本地数据库
-    local = query_term_translation(term)
-    if local:
-        logger.info("本地库找到翻译: %s -> %s", term, local)
-        return local
-
-    # 2️⃣ 根据方法选择
-    method = _decide_translation_method(term)
-    candidates = []
-
-    candidates = _fetch_llm_translation(term)
-    # 去重
-    seen = set()
-    cleaned: List[str] = []
-    for c in candidates:
-        c_clean = c.strip()
-        if c_clean and c_clean not in seen:
-            seen.add(c_clean)
-            cleaned.append(c_clean)
-    return cleaned
-
-def get_translation_candidates_batch(terms: list[str], batch_size: int = 50) -> dict[str, list[str]]:
-    """
-    批量获取翻译候选（带分批机制）。
-    1️⃣ 先查本地库
-    2️⃣ 收集需要 LLM 批量翻译的词
-    3️⃣ 分批调用 LLM，避免请求过大
-    """
-    result: dict[str, list[str]] = {}
-    llm_terms: list[str] = []
-
-    # Step 1: 查询本地翻译
-    for term in terms:
-        local = query_term_translation(term)
-        if local:
-            result[term] = local
-        else:
-            llm_terms.append(term)
-
-    # Step 2: 分批调用 LLM
-    if llm_terms:
-        for i in range(0, len(llm_terms), batch_size):
-            batch = llm_terms[i:i + batch_size]
-            llm_results = _fetch_llm_translation_batch(batch)
-            for term, candidates in llm_results.items():
-                result[term] = candidates
-
-    # Step 3: 清理去重
-    for term, candidates in result.items():
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        for c in candidates:
-            c_clean = c.strip()
-            if c_clean and c_clean not in seen:
-                seen.add(c_clean)
-                cleaned.append(c_clean)
-        result[term] = cleaned
-
-    return result
-
-# ------------------ 单术语翻译 ------------------
-def translate_term(term_en: str) -> List[str]:
-    candidates = _get_translation_candidates(term_en)
-    if not candidates:
-        print(f"最终未找到 {term_en} 的翻译")
-        return []
-    return candidates
 
 def _extract_completion_text(completion) -> str:
-    """从不同 shape 的 completion 中抽取文本内容"""
+    """
+    从不同 shape 的 completion 中抽取文本内容
+    """
     try:
         if isinstance(completion, dict):
             def _find_text(obj):
@@ -275,3 +116,207 @@ def _extract_completion_text(completion) -> str:
         except Exception:
             return ""
 
+
+# ---------------- LLM 调用：按 topic 返回单一最佳释义 ----------------
+
+def _fetch_llm_translation(term: str, topic: Optional[str] = None, retries: int = 2, backoff: float = 1.0) -> List[str]:
+    """
+    使用 LLM 获取单个术语的“最佳且唯一”中文翻译。
+    会结合 topic 作为上下文，强制要求只返回一个最贴切的中文词/短语。
+    返回: 单元素列表以兼容旧接口，若失败则返回空列表。
+    """
+
+    sys_prompt = "把下面术语翻译成中文，仅返回中文翻译。如果得不到翻译，请返回None。"
+    user_prompt = (
+        f"{term}\n"
+    )
+
+    for attempt in range(1, retries + 1):
+        try:
+            completion = DJ_client.chat.completions.create(
+                model="tencent/Hunyuan-MT-7B",
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+            )
+            raw_text = _extract_completion_text(completion).strip()
+            if not raw_text:
+                continue
+            # 规范化：若模型误返回 "term: 翻译" 或包含多项，用分隔符切分取首项
+            if ":" in raw_text:
+                raw_text = raw_text.split(":", 1)[-1].strip()
+            parts = [t.strip() for t in re.split(r"[\n,，、;；]", raw_text) if t.strip()]
+            if not parts and raw_text:
+                parts = [raw_text]
+            # 仅返回一个
+            return [parts[0]] if parts else []
+        except Exception as e:
+            logger.warning("LLM 翻译失败 (attempt %d) for term %s: %s", attempt, term, e)
+            time.sleep(backoff * attempt)
+    return []
+
+
+def _fetch_llm_translation_batch(terms: List[str], topic: Optional[str] = None, retries: int = 2, backoff: float = 1.0) -> Dict[str, List[str]]:
+    """
+    批量调用 LLM 翻译多个词语。使用 JSON 输入和输出来提高稳定性。
+    结合 topic，以“每个词只返回一个最贴切的译名”。
+    返回: {term: [唯一译名]}，失败则为空列表。
+    """
+    if not terms:
+        return {}
+
+    sys_prompt = (
+        "你会收到一个包含'terms'字段的 JSON 对象。"
+        "请将'terms'列表中的每个术语翻译成最贴切的中文。"
+        "你必须返回一个 JSON 对象，其中的键是原始的英文术语，值是对应的中文翻译。"
+        "如果某个术语无法翻译，请在返回的 JSON 中省略该术语。"
+        "示例输入: {\"terms\": [\"Transformer encoder\", \"ResNet\"]}"
+        "示例输出: {\"Transformer encoder\": \"变换器编码器\", \"ResNet\": \"残差网络\"}"
+    )
+
+    input_data = {
+        "terms": terms
+    }
+    user_prompt = json.dumps(input_data, ensure_ascii=False)
+
+    for attempt in range(1, retries + 1):
+        try:
+            completion = DJ_client.chat.completions.create(
+                model="tencent/Hunyuan-MT-7B",
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                # 确保模型开启 JSON 模式（如果 API 支持）
+                # response_format={"type": "json_object"},
+            )
+            raw_text = _extract_completion_text(completion)
+            if not raw_text:
+                continue
+
+            # 尝试从文本中提取 JSON
+            try:
+                # 模型可能返回被 markdown 包裹的 JSON
+                json_match = re.search(r"```json\n({.*})\n```", raw_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    json_str = raw_text
+
+                parsed_json = json.loads(json_str)
+
+                result: Dict[str, List[str]] = {}
+                # 将模型的 {term: "翻译"} 格式转换为 {term: ["翻译"]}
+                for term, translation in parsed_json.items():
+                    if isinstance(translation, str) and translation.strip():
+                        result[term] = [translation.strip()]
+
+                # 为所有输入的 term 保证有 key，未翻译的则为空列表
+                for t in terms:
+                    result.setdefault(t, [])
+                return result
+
+            except json.JSONDecodeError as json_e:
+                logger.warning("LLM 批量翻译返回的 JSON 无效 (attempt %d): %s. Raw text: %s", attempt, json_e, raw_text)
+                continue # 继续重试
+
+        except Exception as e:
+            logger.warning("LLM 批量翻译失败 (attempt %d): %s", attempt, e)
+            time.sleep(backoff * attempt)
+
+    # 如果所有尝试都失败，返回一个所有词都为空列表的字典
+    return {t: [] for t in terms}
+
+
+def _clean_translation_text(text: str) -> str:
+    """Removes content within parentheses (both full-width and half-width)."""
+    return re.sub(r'[\(（][^)）]*[\)）]', '', text).strip()
+
+
+def _get_translation_candidates(term: str, topic: Optional[str] = None) -> List[str]:
+    # 完善的翻译模块
+    # 1️⃣ 尝试本地数据库
+    local = query_term_translation(term)
+    if local:
+        logger.info("本地库找到翻译: %s -> %s", term, local)
+        # 若本地已有多个，仍按旧逻辑返回列表（不截断）
+        return [_clean_translation_text(t) for t in local]
+
+    # 2️⃣ LLM 单项（结合 topic，只返回一个最佳译名）
+    candidates = _fetch_llm_translation(term, topic=topic)
+
+    # 去重和清理
+    seen = set()
+    cleaned: List[str] = []
+    for c in candidates:
+        c_clean = _clean_translation_text(c.strip())
+        if c_clean and c_clean not in seen:
+            seen.add(c_clean)
+            cleaned.append(c_clean)
+    return cleaned
+
+
+def get_translation_candidates_batch(terms: List[str], batch_size: int = 50, topic: Optional[str] = None) -> Dict[str, Optional[List[str]]]:
+    """
+    批量获取翻译候选（带分批机制）。
+    现在会结合 topic，并且每个词只返回一个最佳译名（以单元素列表形式返回）。
+    流程：
+    1️⃣ 先查本地库
+    2️⃣ 收集需要 LLM 批量翻译的词
+    3️⃣ 分批调用 LLM
+    4️⃣ 清理去重
+    """
+    result: Dict[str, Optional[List[str]]] = {}
+    llm_terms: List[str] = []
+
+    # Step 1: 查询本地翻译
+    for term in terms:
+        local = query_term_translation(term)
+        if local:
+            result[term] = local
+        else:
+            llm_terms.append(term)
+
+    # Step 2: 分批调用 LLM（每项只返回一个最佳译名）
+    if llm_terms:
+        for i in range(0, len(llm_terms), batch_size):
+            batch = llm_terms[i:i + batch_size]
+            llm_results = _fetch_llm_translation_batch(batch, topic=topic)
+            for term, candidates in llm_results.items():
+                result[term] = candidates
+
+    # Step 3: 清理去重（尽管每个通常只有一个，但仍保证稳健性）
+    for term, candidates in result.items():
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        if candidates:
+            for c in candidates:
+                c_clean = c.strip()
+                if c_clean and c_clean not in seen:
+                    seen.add(c_clean)
+                    cleaned.append(c_clean)
+        result[term] = cleaned[:1] if cleaned else None
+
+    # 为在 llm_terms 中但未在 result 中的术语设置 None
+    for term in llm_terms:
+        if term not in result:
+            result[term] = None
+    return result
+
+
+# ------------------ 单术语翻译 ------------------
+
+def translate_term(term_en: str, topic: Optional[str] = None) -> Optional[List[str]]:
+    """
+    翻译单个词，结合 topic，只返回一个最佳译名（以单元素列表返回）。
+    如果找不到翻译，则返回 None。
+    """
+    candidates = _get_translation_candidates(term_en, topic=topic)
+    if not candidates:
+        print(f"最终未找到 {term_en} 的翻译")
+        return None
+    # 只保留一个最佳
+    return candidates[:1]

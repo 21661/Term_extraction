@@ -1,200 +1,64 @@
-# main.py (simplified unified batch translation workflow)
+# main.py (simplified unified batch translation workflow via build_graph)
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import uvicorn
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from graph import build_graph_terms_only
 import logging
-import time
-import re
-from utils.Get_term import get_translation_candidates_batch, translate_term as translate_term_external
-from utils.db_interface import query_term_translation, ensure_db_initialized
+from utils.db_interface import ensure_db_initialized
+from graph import build_graph
 
 app = FastAPI(title="Term Extraction API")
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Initialize only the terms-only workflow (extraction without translation)
+# Initialize the unified workflow (extraction + aggregation + translation)
 try:
-    # Try to ensure database and table exist, but don't crash startup if DB is unreachable
     try:
         ensure_db_initialized()
     except Exception as db_e:
         logger.warning("Database initialization failed at startup: %s", db_e)
-    WORKFLOW_TERMS_ONLY = build_graph_terms_only()
+    WORKFLOW = build_graph()
 except Exception as e:
-    logger.exception("Failed to build terms-only graph at startup: %s", e)
-    WORKFLOW_TERMS_ONLY = None
-
-
-def process_chunk_terms_only(chunk_id: str, chunk_text: Any, summary: str) -> Dict[str, Any]:
-    """运行术语提取（不翻译），返回 {chunk_id, terms, term_types, error?}
-
-    现在接受 chunk_id 和 chunk_text 分别作为参数，以便支持 ExtractPayload.chunks 为 Dict[str,str]
-    """
-    if chunk_id is None:
-        return {"chunk_id": None, "terms": [], "term_types": {}, "error": "malformed_chunk"}
-    if WORKFLOW_TERMS_ONLY is None:
-        return {"chunk_id": str(chunk_id), "terms": [], "term_types": {}, "error": "terms_only_workflow_not_initialized"}
-
-    text = chunk_text if isinstance(chunk_text, str) else str(chunk_text)
-
-    init_state = {
-        "text": text,
-        "candidates": [],
-        "terms": [],
-        "topic": summary,
-        "translations": {},
-        "final_translations": {},
-        "term_types": {},
-    }
-    try:
-        result = WORKFLOW_TERMS_ONLY.invoke(init_state)
-        selected_terms = result.get("selected_terms") or result.get("terms") or []
-        term_types = result.get("term_types", {})
-        return {"chunk_id": str(chunk_id), "terms": list(selected_terms), "term_types": dict(term_types)}
-    except Exception as e:
-        logger.exception("terms-only workflow error: %s", e)
-        return {"chunk_id": str(chunk_id), "terms": [], "term_types": {}, "error": str(e)}
-
-
-def pick_best_translation(cands: List[str]) -> str:
-    for c in cands:
-        if re.search(r"[\u4e00-\u9fff]", c):
-            return c.strip()
-    for c in cands:
-        if c.strip():
-            return c.strip()
-    return ""
+    logger.exception("Failed to build unified graph at startup: %s", e)
+    WORKFLOW = None
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "terms_only_initialized": WORKFLOW_TERMS_ONLY is not None}
+    return {"status": "ok", "workflow_initialized": WORKFLOW is not None}
 
 
 class ExtractPayload(BaseModel):
     summary: Optional[str] = Field("", description="主题/上下文，可选")
-    chunks: Dict[str, str] = Field(..., description="列表，每项为单个键值对：{id: text}")
+    chunks: Dict[str, str] = Field(..., description="对象形式的段落集合：{id: text}")
+
 
 @app.post("/extract")
 async def extract(payload: ExtractPayload):
     """
-    统一翻译模式（现在使用 Pydantic 模型作为请求体）：
-    1) 并行处理每段，提取术语（不翻译）
-    2) 汇总全部唯一术语，一次性批量翻译
-    3) 将翻译结果按每段术语映射回去并返回注释
+    使用 graph.build_graph 构建的统一流程：
+    - 输入：summary + chunks
+    - 自动执行每段术语提取、汇总去重、批量翻译与组装注释
+    - 输出：termAnnotations（按需简化为只返回注释对象）
     """
-    summary = payload.summary or ""
-    chunks = payload.chunks
+    if WORKFLOW is None:
+        return JSONResponse({"termAnnotations": {}})
 
-    # 1) 并行术语提取
-    per_chunk_results: List[Dict[str, Any]] = []
-    errors: List[Dict[str, str]] = []
-    start_ts = time.time()
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        # chunks is now a Dict[str, str], iterate items and pass id/text separately
-        futures = [executor.submit(process_chunk_terms_only, cid, ctext, summary) for cid, ctext in chunks.items()]
-        for f in as_completed(futures):
-            r = f.result()
-            if not r:
-                continue
-            if r.get("error"):
-                errors.append({"chunk_id": r.get("chunk_id"), "error": r.get("error")})
-            per_chunk_results.append(r)
-    logger.info("Terms-only extraction done for %d chunks in %.2fs", len(chunks), time.time() - start_ts)
-
-    # 2) 汇总唯一术语
-    all_terms: List[str] = []
-    for r in per_chunk_results:
-        all_terms.extend(r.get("terms", []))
-    unique_terms = sorted(set(t for t in all_terms if isinstance(t, str) and t.strip()))
-
-    # 3) 批量翻译
-    translations_map: Dict[str, List[str]] = {}
-    try:
-        if unique_terms:
-            batch_size = 50
-            batches = [unique_terms[i:i + batch_size] for i in range(0, len(unique_terms), batch_size)]
-            max_workers = 5
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_idx = {
-                    executor.submit(get_translation_candidates_batch, batch, batch_size=batch_size): idx
-                    for idx, batch in enumerate(batches)
-                }
-                for f in as_completed(future_to_idx):
-                    idx = future_to_idx[f]
-                    try:
-                        res = f.result() or {}
-                        if isinstance(res, dict):
-                            translations_map.update(res)
-                        else:
-                            logger.warning("Batch %d returned non-dict result, ignored", idx)
-                    except Exception as e:
-                        logger.warning("Batch translation failed for batch %d: %s", idx, e)
-    except Exception as e:
-        logger.warning("Batch translation failed, will fallback to single + db: %s", e)
-        translations_map = {}
-
-    # 单项回退 + DB 回退
-    for t in unique_terms:
-        if translations_map.get(t):
-            continue
-        try:
-            single = translate_term_external(t) or []
-        except Exception:
-            single = []
-        if not single:
-            try:
-                local = query_term_translation(t) or []
-                single = local
-            except Exception:
-                pass
-        translations_map[t] = single or []
-
-    # 4) 按分段组装结果为对象映射: {chunk_id: {"term": {term:trans,..}, "proper_noun": {...}}}
-    term_annotations: Dict[str, Any] = {}
-    translated_count = 0
-    for r in per_chunk_results:
-        cid = str(r.get("chunk_id"))
-        term_types = r.get("term_types", {}) or {}
-        final_translations: Dict[str, str] = {}
-        for t in r.get("terms", []):
-            cands = translations_map.get(t, [])
-            chosen = pick_best_translation(cands)
-            if chosen:
-                final_translations[t] = chosen
-
-        term_map: Dict[str, str] = {}
-        pn_map: Dict[str, str] = {}
-        for term, trans in final_translations.items():
-            ttype = term_types.get(term, "term")
-            if ttype == "proper_noun":
-                pn_map[term] = trans
-            else:
-                term_map[term] = trans
-
-        if term_map or pn_map:
-            term_annotations[cid] = {"term": term_map, "proper_noun": pn_map}
-            translated_count += len(term_map) + len(pn_map)
-        else:
-            # per your example, empty chunk entry should be an empty object
-            term_annotations[cid] = {}
-
-    # Attach stats inside termAnnotations object per requested format
-    stats = {
-        "total_chunks": len(chunks),
-        "unique_terms": len(unique_terms),
-        "translated_terms": translated_count,
+    init_state: Dict[str, Any] = {
+        "summary": payload.summary or "",
+        "chunks": payload.chunks or {},
     }
 
+    try:
+        result: Dict[str, Any] = WORKFLOW.invoke(init_state)  # type: ignore
+    except Exception as e:
+        logger.exception("Unified graph invocation failed: %s", e)
+        return JSONResponse({"term_annotations": {}})
 
-    resp = {"termAnnotations": term_annotations,"stats":stats}
-    if errors:
-        resp["errors"] = errors
-    logger.warning("Extraction completed cost Time %.2fs", time.time() - start_ts)
+    resp: Dict[str, Any] = {
+        "term_annotations": result.get("termAnnotations", {}),
+    }
     return JSONResponse(resp)
 
 

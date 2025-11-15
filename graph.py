@@ -1,41 +1,20 @@
-from typing import List, TypedDict, Dict, Set
+from typing import List, TypedDict, Dict
 from langgraph.graph import StateGraph, END
-import re
 import spacy
 import json
 import time
 import logging
-import itertools
-from functools import wraps
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils.zhipu_client import client
 from utils.db_interface import query_term_translation, save_translation
 from utils.web_fetcher import fetch_core_translations
-from utils.Get_term import translate_term as translate_term_external
+from utils.Get_term import translate_term as translate_term_external, get_translation_candidates_batch,translate_term
+from utils.workflow_adapter import _rewrap,_unwrap
+from utils.extract_candidates import extract_candidates
+from utils.TimeNode import timed_node
+from utils.candidate_tool import normalize_candidate, is_noise_candidate, dedupe_keep_longest, _MAX_TERMS_TO_PROCESS, _LLM_RETRIES, _RETRY_BACKOFF, _COMMON_GENERIC_WORDS
 import typing
-
-
-# 简单的包装/解包辅助（兼容工作流可能传入的三元组包装或直接 dict）
-def _unwrap(raw: typing.Any):
-    """解包状态：若 state 是三元组 (inner, parent, key) 则返回它，否则若为 dict 则返回 (dict, None, None)。"""
-    try:
-        if isinstance(raw, tuple) and len(raw) == 3:
-            return raw
-    except Exception:
-        pass
-    if isinstance(raw, dict):
-        return raw, None, None
-    return raw, None, None
-
-
-def _rewrap(original_raw: typing.Any, parent, key, new_inner: typing.MutableMapping):
-    """将 new_inner 包回：若 original_raw 为三元组则返回 (new_inner, parent, key)，否则返回 new_inner 本身。"""
-    try:
-        if isinstance(original_raw, tuple) and len(original_raw) == 3:
-            return (new_inner, parent, key)
-    except Exception:
-        pass
-    return new_inner
-
 
 # ===================== 1️⃣ 定义状态类型 =====================
 class TermState(TypedDict):
@@ -48,396 +27,28 @@ class TermState(TypedDict):
 
 
 # ===================== 2️⃣ 初始化 =====================
-nlp = spacy.load("en_core_web_sm")
+nlp = spacy.load("en_core_web_trf")
 
 # logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 可调参数
-_MAX_TERMS_TO_PROCESS = 10  # 目标提取 5-6 个术语（最大候选数）
-_LLM_RETRIES = 2
-_RETRY_BACKOFF = 1.0
-_NOISE_MIN_CHAR = 2
-
-# Performance tuning params
-_MAX_NOUN_CHUNKS = 80
-_TRANSLATE_WORKERS = 6
-_TRANSLATE_TIMEOUT = 6.0  # seconds per translation task
-
-# LLM call tuning
-_LLM_TIMEOUT = 12.0  # seconds per LLM request
-_LLM_CACHE_ENABLED = True
-
-# counters
-LLM_CALLS = 0
-DICT_CALLS = 0
-
-# 常见非术语噪声词（小写）
-_EXTRA_NOISE = {
-    "that", "this", "these", "those", "it", "they", "he", "she",
-    "a", "an", "the", "use", "uses", "used", "based",
-}
-# 明显不应入库的普通词（可扩展）
-_COMMON_GENERIC_WORDS = {
-    "that", "this", "an", "a", "the", "function", "input", "output",
-    "example", "learning", "machine", "maps", "pairs", "task",
-}
 
 
-# ----------------- 简化版 helpers（已移除缓存与并发，便于验证） -----------------
-def _cached_nlp(text: str):
-    """直接调用 spaCy（已移除缓存）。"""
-    return nlp(text)
-
-
-def _cached_translate_term_external(term: str):
-    """直接调用外部翻译器（无缓存）。返回列表形式以兼容现有代码。"""
-    try:
-        res = translate_term_external(term) or []
-        return list(res)
-    except Exception:
-        return []
-
-
-def _cached_fetch_core_translations(term: str):
-    """直接调用 fetch_core_translations（无缓存）。"""
-    try:
-        res = fetch_core_translations(term) or []
-        return list(res)
-    except Exception:
-        return []
-
-
-def _cached_llm_completion(prompt: str, system: str = "你是术语分类助手") -> str:
-    """直接调用 LLM，同步阻塞，不做缓存或线程超时控制（便于验证正确性）。
-
-    注意：如果你需要超时保护，可以在后续恢复线程/超时逻辑。
-    """
-    global LLM_CALLS
-    LLM_CALLS += 1
+# ----------------- Helpers (no caching) -----------------
+def llm_completion(prompt: str, system: str = "你是术语分类助手") -> str:
+    """直接调用 LLM，同步阻塞，不做缓存或超时保护。"""
     try:
         completion = client.chat.completions.create(
-            model="glm-4-FlashX-250414",
+            model="glm-4.5-flash",
             messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-            # thinking={
-            #     "type": "disabled",
-            # },
             temperature=0,
         )
         return _safe_extract_completion_content(completion)
     except Exception as e:
         logger.warning("LLM direct call failed: %s", e)
-        return ""
-
-
-# Decorator to time node functions and log start/finish with simple state sizes
-def timed_node(name: str = None):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            node_name = name or func.__name__
-            logger.info("Node %s START", node_name)
-            start = time.perf_counter()
-            try:
-                return func(*args, **kwargs)
-            finally:
-                end = time.perf_counter()
-                dur = end - start
-                # Try to extract counts from the first arg if it's the workflow state
-                try:
-                    state = args[0] if args else None
-                    inner, parent, key = _unwrap(state) if state is not None else (None, None, None)
-                    sd = inner if isinstance(inner, dict) else (state if isinstance(state, dict) else {})
-                    cands = sd.get("candidates") if isinstance(sd, dict) else None
-                    terms = sd.get("terms") if isinstance(sd, dict) else None
-                    trans = sd.get("translations") if isinstance(sd, dict) else None
-                    logger.info("Node %s END (%.3fs) candidates=%s terms=%s translations=%s", node_name, dur,
-                                (len(cands) if isinstance(cands, (list, set)) else '-' ),
-                                (len(terms) if isinstance(terms, (list, set)) else '-' ),
-                                (len(trans) if isinstance(trans, dict) else '-' ))
-                except Exception:
-                    logger.info("Node %s END (%.3fs)", node_name, dur)
-        return wrapper
-    return decorator
-
-
-# ===================== 辅助函数：标准化/噪声过滤/去重 =====================
-LEADING_ARTICLES = re.compile(r'^(?:a|an|the)\s+', flags=re.I)
-
-
-def normalize_candidate(text: str) -> str:
-    """
-    更严格的标准化：
-    - 去首尾空白、首冠词、去除 possessive (\'s) 与不必要引号/括号
-    - 合并空格、小写
-    - 返回空字符串表示被完全移除
-    """
-    if not text:
-        return ""
-    s = text.strip()
-    # 去掉典型的首冠词
-    s = re.sub(r'^(?:a|an|the)\s+', '', s, flags=re.I)
-    # 去掉 possessive " 's" 与孤立的单引号、双引号以及包裹的括号
-    s = re.sub(r"\'s\b", "", s, flags=re.I)
-    s = s.strip(" `\"“”()[]{}")
-    # 删除两端多余标点（保留中间的连字符/斜杠）
-    s = re.sub(r'^[.:;\-]+|[.:;\-]+$', '', s)
-    s = re.sub(r'\s+', ' ', s)
-    s = s.lower().strip()
-    return s
-
-
-def is_noise_candidate(candidate: str) -> bool:
-    if not candidate:
-        return True
-    if candidate in _EXTRA_NOISE:
-        return True
-    # 很短的非字母串
-    if len(candidate.replace(" ", "")) <= _NOISE_MIN_CHAR:
-        return True
-    # 必须包含字母
-    if not re.search(r"[a-zA-Z]", candidate):
-        return True
-
-    # 使用 spaCy 进一步判断：至少包含一个名词/专有名词
-    try:
-        doc = _cached_nlp(candidate)
-    except Exception:
-        doc = nlp(candidate)
-    has_content = any(getattr(t, 'pos_', None) in ("NOUN", "PROPN") for t in doc)
-    if not has_content:
-        return True
-    # 避免仅为代词/限定词
-    all_noise = all((getattr(t, 'is_stop', False) or getattr(t, 'pos_', None) in ("PRON", "DET", "ADP", "PART", "PUNCT")) for t in doc)
-    if all_noise:
-        return True
-    return False
-
-
-def dedupe_keep_longest(candidates: List[str]) -> List[str]:
-    """保留最长短语，若 A 完整包含 B（词边界）则保留 A，丢弃 B。"""
-    uniq = sorted(set(candidates), key=lambda x: (-len(x.split()), x))
-    kept: List[str] = []
-    for cand in uniq:
-        cand_words_pattern = r'\b' + re.escape(cand) + r'\b'
-        skip = False
-        for k in kept:
-            if re.search(cand_words_pattern, k):
-                skip = True
-                break
-        if not skip:
-            kept.append(cand)
-    # 返回稳定排序（按长度和字母）
-    return sorted(kept)
-
-
-def extract_candidates(state: typing.Any) -> TermState:
-    original = state
-    inner, parent, key = _unwrap(state)
-    state = inner if isinstance(inner, dict) else {"text": ""}
-    state_dict: dict = typing.cast(dict, state)
-
-    text = state_dict.get("text", "")
-    if not text:
-        logger.warning("extract_candidates received state without 'text' key")
-        state_dict.setdefault("text", "")
-        text = state_dict["text"]
-
-    candidates: Set[str] = set()
-
-    # 1️⃣ spaCy 名词短语（限制数量以提高速度）
-    doc = _cached_nlp(text)
-    for chunk in itertools.islice(doc.noun_chunks, _MAX_NOUN_CHUNKS):
-        chunk_text = getattr(chunk, "text", str(chunk)).strip()
-        if chunk_text:  # 不限制长度，但限制总数
-            candidates.add(chunk_text)
-
-    # 2️⃣ spaCy 专有名词
-    proper_nouns = {getattr(token, "text", str(token)).strip()
-                    for token in doc if getattr(token, "pos_", None) == "PROPN"}
-    candidates.update(proper_nouns)
-
-    # 3️⃣ 连字符/下划线组合、缩写
-    regex_terms = set(re.findall(r"\b[A-Za-z]+(?:[-_/][A-Za-z]+)+\b", text))
-    candidates.update(regex_terms)
-
-    # 4️⃣ 标准化 + 去噪（只去掉明显无用短词）
-    normalized = []
-    for c in candidates:
-        c_norm = normalize_candidate(c)
-        if not c_norm:
-            continue
-        if c_norm in _EXTRA_NOISE:
-            continue
-        # 至少包含一个字母
-        if not re.search(r"[a-zA-Z]", c_norm):
-            continue
-        normalized.append(c_norm)
-
-    # 5️⃣ 去重复，优先保留最长短语
-    final_candidates = dedupe_keep_longest(normalized)
-
-    # 使用启发式评分对候选进行排序并优先选取 top N（替代 KeyBERT）
-    def score_candidate(cand: str) -> float:
-        s = 0.0
-        cand_l = cand.lower()
-        text_l = text.lower()
-        # 出现频次（更频繁优先）
-        try:
-            occ = text_l.count(cand_l)
-        except Exception:
-            occ = 0
-        s += occ * 2.0
-        # 词数（更长短语稍微加分）
-        words = len(cand.split())
-        s += 0.5 * words
-        # 词性评分：尽量复用原始 doc 的字符跨度以避免重复解析
-        pos_score = 0
-        start_idx = text_l.find(cand_l)
-        if start_idx >= 0:
-            span = doc.char_span(start_idx, start_idx + len(cand_l), alignment_mode='expand')
-            if span is not None:
-                for t in span:
-                    if getattr(t, 'pos_', None) == 'PROPN':
-                        pos_score += 2
-                    elif getattr(t, 'pos_', None) == 'NOUN':
-                        pos_score += 1
-                    elif getattr(t, 'pos_', None) == 'ADJ':
-                        pos_score += 0.3
-        else:
-            # 回退到缓存的 nlp 分析
-            try:
-                docc = _cached_nlp(cand)
-                for t in docc:
-                    if getattr(t, 'pos_', None) == 'PROPN':
-                        pos_score += 2
-                    elif getattr(t, 'pos_', None) == 'NOUN':
-                        pos_score += 1
-                    elif getattr(t, 'pos_', None) == 'ADJ':
-                        pos_score += 0.3
-            except Exception:
-                pass
-        s += pos_score
-
-        # 包含连字符/下划线视为技术短语，加分
-        if re.search(r"[-_/]", cand):
-            s += 1.0
-        # 出现位置：越靠前越好
-        idx = text_l.find(cand_l)
-        if idx >= 0:
-            pos_bonus = max(0.0, 1.0 - (idx / max(1, len(text_l))))
-            s += pos_bonus
-        # 长度归一化小加分
-        s += min(len(cand), 50) / 50.0
-        return s
-
-    scored = []
-    for c in final_candidates:
-        if is_noise_candidate(c):
-            continue
-        scored.append((score_candidate(c), c))
-    # 按分数降序，分数相同时按短语长度降序
-    scored.sort(key=lambda x: (-x[0], -len(x[1].split())))
-    final_candidates = [c for _, c in scored][:_MAX_TERMS_TO_PROCESS]
-
-    # 6️⃣ 限制数量，避免后续大量 LLM 调用
-    if len(final_candidates) > _MAX_TERMS_TO_PROCESS:
-        logger.info("候选术语过多(%d)，截断到 %d", len(final_candidates), _MAX_TERMS_TO_PROCESS)
-        final_candidates = final_candidates[:_MAX_TERMS_TO_PROCESS]
-
-    state_dict["candidates"] = sorted(final_candidates)
-    result = _rewrap(original, parent, key, state_dict)
-    return result
-
-
-# ===================== 4️⃣ 术语筛选（调用 LLM 后再清洗） =====================
-@timed_node()
-def filter_terms(state: typing.Any) -> TermState:
-    original = state
-    inner, parent, key = _unwrap(state)
-    state = inner if isinstance(inner, dict) else {"candidates": []}
-    state_dict: dict = typing.cast(dict, state)
-
-    # quick local fallback: if very few candidates, avoid LLM and use rules
-    cands = state_dict.get("candidates", [])
-    if not cands:
-        state_dict["terms"] = []
-        state_dict.setdefault("term_types", {})
-        return _rewrap(original, parent, key, state_dict)
-
-    if len(cands) <= 2:
-        filtered = []
-        for c in cands:
-            c_norm = normalize_candidate(c)
-            if not c_norm:
-                continue
-            if is_noise_candidate(c_norm):
-                continue
-            filtered.append(c_norm)
-        state_dict["terms"] = sorted(set(filtered))
-        # 简单情况全部视为 term
-        state_dict["term_types"] = {t: "term" for t in state_dict["terms"]}
-        return _rewrap(original, parent, key, state_dict)
-
-    prompt = """
-你是一个专业术语识别助手。下面给出一个候选术语列表（来自文档自动抽取）。请严格从该候选列表中挑选并分类，返回严格的 JSON 对象（仅此输出，绝对不要添加任何解释性文字、注释或换行之外的内容）。输出格式必须是一个 JSON 对象，包含两个键： "term" 和 "proper_noun"，它们对应的值都是字符串数组。例如：{"term":["术语A","术语B"],"proper_noun":["专有名1"]}
-约束与规则（务必遵守）：
-只从候选列表中选择候选项，且必须按候选列表中的原样文本返回（不要改写候选文本的字面形式）。不要创造新术语或拼写变体；如果候选里存在同义或重复项只保留一次。
-分类说明：
-"term"：学术/技术术语、
-"proper_noun"：专有名词、算法名、明确的缩写或首字母缩写
-长度限制：所选短语长度（以词为单位）不应超过 4–5 个单词。超过该长度的候选请排除，除非它明显为一个已命名的专有名，
-严格排除：不要选择明显的普通词或无意义短语，例如 "data", "set", "vector", "each example", "the method", "this paper" 等。若候选仅是停用词/代词/短泛词，应排除。
-输出要求：
-必须返回合法可 parse 的 JSON，仅此一行或紧凑 JSON（不允许多行文本/人类说明）。
-"""
-    try:
-        cands_repr = json.dumps(state_dict.get('candidates', []), ensure_ascii=False)
-    except Exception:
-        cands_repr = str(state_dict.get('candidates', []))
-    prompt += "\n候选词列表:\n" + cands_repr + "\n"
-
-    terms = []
-    proper_nouns = []
-    term_types: Dict[str, str] = {}
-    try:
-        raw_text = _cached_llm_completion(prompt, system="你是术语分类助手")
-        if not raw_text:
-            raise ValueError("empty LLM response or timed out")
-        parsed = json.loads(raw_text)
-        terms = list(set(parsed.get("term", [])))
-        proper_nouns = list(set(parsed.get("proper_noun", [])))
-    except Exception as e:
-        logger.warning("LLM 分类失败或返回非 JSON，降级过滤: %s", e)
-        candidates = state_dict.get("candidates", [])
-        filtered = []
-        for c in candidates:
-            if is_noise_candidate(c):
-                continue
-            dd = _cached_nlp(c)
-            if any(getattr(t, 'pos_', None) in ("NOUN", "PROPN") for t in dd):
-                filtered.append(c)
-        terms = dedupe_keep_longest(filtered)
-        proper_nouns = []
-
-    final_terms = []
-    for t in set(terms + proper_nouns):
-        t_norm = normalize_candidate(t)
-        if not t_norm or is_noise_candidate(t_norm):
-            continue
-        final_terms.append(t_norm)
-        if t in proper_nouns:
-            term_types[t_norm] = "proper_noun"
-        else:
-            term_types[t_norm] = "term"
-
-    state_dict["terms"] = sorted(set(final_terms))
-    state_dict["term_types"] = term_types
-    result = _rewrap(original, parent, key, state_dict)
-    return result
-
-
+        return "None"
+    # no caching or decorator returned; function ends here
 # ===================== 5️⃣ 判断抓取方式 =====================
 def decide_post_db_method(term: str) -> str:
     term_lower = term.lower()
@@ -448,8 +59,6 @@ def decide_post_db_method(term: str) -> str:
         return "llm"
     return "dict"
 
-
-# ===================== 6️⃣ 获取候选翻译（带缓存与重试） =====================
 def _safe_extract_completion_content(completion) -> str:
     """Robustly extract text/content from various completion response shapes.
     Returns empty string when content is missing or blank.
@@ -483,23 +92,6 @@ def _safe_extract_completion_content(completion) -> str:
         return ""
 
 
-def _fetch_core_translations_with_retry(term: str, retries=2, backoff=1.0):
-    global DICT_CALLS
-    attempt = 0
-    while attempt <= retries:
-        attempt += 1
-        try:
-            DICT_CALLS += 1
-            # use cached wrapper to avoid repeated network calls
-            return list(_cached_fetch_core_translations(term))
-        except Exception as e:
-            logger.warning("fetch_core_translations attempt %d failed for %s: %s", attempt, term, e)
-            if attempt > retries:
-                return []
-            time.sleep(backoff * attempt)
-
-
-# ===================== 7️⃣ 翻译节点（并发 + 缓存 + 超时） =====================
 @timed_node()
 def translate_node(state: typing.Any) -> TermState:
     """Concurrent translation of detected terms with caching and timeouts.
@@ -516,17 +108,18 @@ def translate_node(state: typing.Any) -> TermState:
 
     # 优先使用 selected_terms（由 select_top_terms 节点生成）
     terms = state_dict.get("selected_terms") or state_dict.get("terms") or []
+    topic = state_dict.get("topic") or state_dict.get("summary") or ""
     if not terms:
         state_dict["translations"] = translations
         state_dict["final_translations"] = final_translations
         return _rewrap(original, parent, key, state_dict)
 
     # -----------------------------
-    # 🔹 新增：批量调用本地翻译接口（含 LLM 批量翻译）
+    # 🔹 新增：批量调用本地翻译接口（含 LLM 批量翻译），传入 topic
     # -----------------------------
     try:
-        from utils.Get_term import get_translation_candidates_batch
-        batch_result = get_translation_candidates_batch(terms)
+        from utils.Get_term import get_translation_candidates_batch as _batch
+        batch_result = _batch(terms, topic=topic)
     except Exception as e:
         logger.warning("批量翻译失败，回退到单项模式: %s", e)
         batch_result = {}
@@ -541,7 +134,7 @@ def translate_node(state: typing.Any) -> TermState:
         if not candidates:
             try:
                 from utils.Get_term import translate_term as translate_term_external
-                candidates = translate_term_external(term)
+                candidates = translate_term_external(term, topic=topic)
             except Exception as e:
                 logger.warning("单项回退翻译失败 %s: %s", term, e)
                 candidates = []
@@ -582,15 +175,41 @@ def translate_node(state: typing.Any) -> TermState:
 def select_top_terms(state: typing.Any) -> TermState:
     """从 state['terms'] 中选出最多 _MAX_TERMS_TO_PROCESS 个高质量术语，输出到 state['selected_terms']。
 
-    优先使用 LLM；失败时使用启发式降级。
+    保持术语的原始大小写；只在内部比较/去重时使用 normalize_candidate。
     """
     original = state
     inner, parent, key = _unwrap(state)
     state = inner if isinstance(inner, dict) else {"terms": []}
     state_dict: dict = typing.cast(dict, state)
 
-    terms = list(state_dict.get("terms", []) or [])
+    # 尝试从已有的 terms 获取；若没有，则退回到 candidates
+    terms = list(state_dict.get("terms") or [])
     topic = state_dict.get("topic", "")
+
+    # 若 terms 为空，从 candidates 基于原始字符串构建，噪声过滤和去重时用 normalize_candidate
+    if not terms:
+        candidates = state_dict.get("candidates") or []
+        filtered_original: list[str] = []
+        for c in candidates:
+            if not isinstance(c, str):
+                c = str(c)
+            if not c.strip():
+                continue
+            if is_noise_candidate(c):
+                continue
+            filtered_original.append(c)
+        # 使用 normalize_candidate 做 key 去重，但保留第一出现的原始形式
+        seen = set()
+        deduped: list[str] = []
+        for t in filtered_original:
+            key_norm = normalize_candidate(t)
+            if not key_norm:
+                continue
+            if key_norm in seen:
+                continue
+            seen.add(key_norm)
+            deduped.append(t)
+        terms = deduped
 
     if not terms:
         state_dict["selected_terms"] = []
@@ -600,9 +219,9 @@ def select_top_terms(state: typing.Any) -> TermState:
         state_dict["selected_terms"] = terms
         return _rewrap(original, parent, key, state_dict)
 
-    # 构建 LLM prompt，要求返回 JSON 列表: ["term1","term2",...]
+    # 构建 LLM prompt
     sel_prompt = f"""
-你是术语筛选助手。下面给出若干候选术语，请从中选出最核心的 {_MAX_TERMS_TO_PROCESS} 个术语，按重要性排序并只返回 JSON 数组, 如:["术语1","术语2",...]
+你是术语筛选助手。下面给出若干候选术语，请从中选出最核心的术语，要求必须是不容易翻译或者多义的，很容易翻译的，基础的务必排除。不超过{_MAX_TERMS_TO_PROCESS}个。按重要性排序并只返回 JSON 数组, 如:["术语1","术语2",...]
 主题: {topic}
 候选:
 """
@@ -610,25 +229,29 @@ def select_top_terms(state: typing.Any) -> TermState:
         sel_prompt += f"\n- {t}"
 
     raw = None
-    chosen_list = None
+    chosen_norm_keys: typing.Optional[list[str]] = None
     for attempt in range(1, _LLM_RETRIES + 1):
         try:
-            raw = _cached_llm_completion(sel_prompt, system="你是术语筛选助手，严格返回 JSON 列表。")
+            raw = llm_completion(sel_prompt, system="你是术语筛选助手，严格返回 JSON 列表。")
             if not raw:
                 time.sleep(_RETRY_BACKOFF * attempt)
                 continue
             parsed = json.loads(raw)
             if isinstance(parsed, list):
-                # 归一化并只保留在原始 terms 列表中的项
-                chosen_list = []
-                term_norm_set = {normalize_candidate(x): x for x in terms}
+                # 使用 normalize_candidate 匹配 LLM 返回的术语，但最终保留原始形式
+                term_norm_to_original: dict[str, str] = {}
+                for t in terms:
+                    key_norm = normalize_candidate(t)
+                    if key_norm and key_norm not in term_norm_to_original:
+                        term_norm_to_original[key_norm] = t
+                chosen_norm_keys = []
                 for item in parsed:
                     if not isinstance(item, str):
                         continue
                     item_norm = normalize_candidate(item)
-                    if item_norm in term_norm_set and item_norm not in chosen_list:
-                        chosen_list.append(item_norm)
-                if chosen_list:
+                    if item_norm in term_norm_to_original and item_norm not in chosen_norm_keys:
+                        chosen_norm_keys.append(item_norm)
+                if chosen_norm_keys:
                     break
         except Exception as _e:
             logger.debug("LLM select_top_terms 失败（尝试 %d）: %s", attempt, _e)
@@ -636,29 +259,39 @@ def select_top_terms(state: typing.Any) -> TermState:
                 logger.debug("LLM raw output (select_top_terms): -----\n%s\n-----", raw)
             time.sleep(_RETRY_BACKOFF * attempt)
 
-    if chosen_list is None:
-        # 降级：启发式选择，按出现位置和词数排序
-        text = state_dict.get("text", "").lower()
-        scored = []
+    if chosen_norm_keys is None:
+        # 启发式降级：这里也保持原始大小写
+        text_lower = state_dict.get("text", "").lower()
+        scored: list[tuple[float, str]] = []
         for t in terms:
-            score = 0
+            score = 0.0
             score += len(t.split()) * 0.1
-            idx = text.find(t.lower())
+            idx = text_lower.find(t.lower())
             if idx >= 0:
-                score += max(0.0, 1.0 - (idx / max(1, len(text))))
+                score += max(0.0, 1.0 - (idx / max(1, len(text_lower))))
             scored.append((score, t))
         scored.sort(key=lambda x: -x[0])
-        chosen_list = [normalize_candidate(t) for _, t in scored[:_MAX_TERMS_TO_PROCESS]]
+        # 直接取前 N 个原始形式
+        selected_terms = [t for _, t in scored[:_MAX_TERMS_TO_PROCESS]]
+    else:
+        # 根据 chosen_norm_keys 映射回原始形式
+        term_norm_to_original: dict[str, str] = {}
+        for t in terms:
+            key_norm = normalize_candidate(t)
+            if key_norm and key_norm not in term_norm_to_original:
+                term_norm_to_original[key_norm] = t
+        selected_terms = []
+        for nk in chosen_norm_keys:
+            orig = term_norm_to_original.get(nk)
+            if orig and orig not in selected_terms:
+                selected_terms.append(orig)
 
     # 保证长度不超过 N
-    chosen_list = list(dict.fromkeys(chosen_list))[:_MAX_TERMS_TO_PROCESS]
-
-    state_dict["selected_terms"] = chosen_list
-    result = _rewrap(original, parent, key, state_dict)
-    return result
+    selected_terms = selected_terms[:_MAX_TERMS_TO_PROCESS]
+    state_dict["selected_terms"] = selected_terms
+    return _rewrap(original, parent, key, state_dict)
 
 
-# ===================== 重构：只负责从 translations 中选择最终翻译并保存 =====================
 @timed_node()
 def finalize_translations(state: typing.Any) -> TermState:
     """在已翻译的 translations_map 中为 state['selected_terms']（或 state['terms']）选择最终翻译并保存。
@@ -677,97 +310,365 @@ def finalize_translations(state: typing.Any) -> TermState:
 
     def pick_best_candidate(term: str, candidates: List[str]) -> typing.Optional[str]:
         if not candidates:
-            return None
+            return "none"
         for c in candidates:
             if re.search(r"[\u4e00-\u9fff]", c):
                 return c.strip()
         for c in candidates:
             if c and c.strip():
                 return c.strip()
-        return None
+        return "none"
 
     for term in terms[:_MAX_TERMS_TO_PROCESS]:
         candidates = translations_map.get(term, [])
         chosen = pick_best_candidate(term, candidates)
-        if chosen:
+        if chosen and chosen.lower() != "none":
             chosen_norm = chosen.strip()
-            if normalize_candidate(term) in _COMMON_GENERIC_WORDS:
+            # 使用 .lower() 进行临时比较
+            if term.lower() in _COMMON_GENERIC_WORDS:
                 continue
             try:
-                if len(term) > 1 and normalize_candidate(term) not in _COMMON_GENERIC_WORDS:
+                # 使用 .lower() 进行临时比较
+                if len(term) > 1 and term.lower() not in _COMMON_GENERIC_WORDS:
                     save_translation(term, chosen_norm, "term")
             except Exception:
                 logger.debug("保存翻译时出错: %s -> %s", term, chosen_norm)
             final_translations[term] = chosen_norm
+        else:
+            final_translations[term] = "none"
 
     state_dict["final_translations"] = final_translations
     result = _rewrap(original, parent, key, state_dict)
     return result
 
 
-# ===================== 9️⃣ 构建 LangGraph 工作流 =====================
+# ===================== 9️⃣ 构建 LangGraph 工作流（重构为 main.extract 的批处理流程） =====================
+_TERMS_ONLY_WORKFLOW = None
+
+
 @timed_node()
-def build_graph():
-    # Use a generic mapping type for the graph's input type to satisfy type checkers
-    graph = StateGraph(dict)  # type: ignore
-    graph.add_node("extract_candidates", extract_candidates)  # type: ignore
-    graph.add_node("filter_terms", filter_terms)  # type: ignore
-    # 新增先选择 top-N 的节点
-    graph.add_node("select_top_terms", select_top_terms)  # type: ignore
-    # 翻译只作用于 selected_terms
-    graph.add_node("translate_node", translate_node)  # type: ignore
-    # 最终翻译选择器
-    graph.add_node("finalize_translations", finalize_translations)  # type: ignore
-
-    graph.set_entry_point("extract_candidates")
-    graph.add_edge("extract_candidates", "filter_terms")
-    graph.add_edge("filter_terms", "select_top_terms")
-    graph.add_edge("select_top_terms", "translate_node")
-    graph.add_edge("translate_node", "finalize_translations")
-    graph.add_edge("finalize_translations", END)
-    return graph.compile()
+def _init_extract_state(state: typing.Any) -> dict:
+    """初始化 extract 流程所需字段。输入需包含: summary(str), chunks(dict[str,str])"""
+    original = state
+    inner, parent, key = _unwrap(state)
+    state = inner if isinstance(inner, dict) else {}
+    sd: dict = typing.cast(dict, state)
+    sd.setdefault("summary", sd.get("topic", "") or "")
+    sd.setdefault("chunks", {})
+    sd.setdefault("per_chunk_results", [])
+    sd.setdefault("unique_terms", [])
+    sd.setdefault("translations_map", {})
+    sd.setdefault("termAnnotations", {})
+    sd.setdefault("stats", {})
+    sd.setdefault("errors", [])
+    return _rewrap(original, parent, key, sd)
 
 
-# ===================== 🔟 手动测试 =====================
-if __name__ == "__main__":
-    text = "This study proposes a multimodal deep learning framework for semantic segmentation of remote sensing imagery, aiming to address the well-known trade-off between the spatial resolution of panchromatic images and the spectral richness of hyperspectral data. We construct a dual-branch encoder in which one branch focuses on hyperspectral feature extraction and the other on panchromatic spatial enhancement."
-    topic = "Multimodal remote sensing image semantic segmentation — emphasizing cross-modal feature fusion, adaptive attention mechanisms, hybrid loss design, and multi-scale supervision to improve segmentation accuracy and generalization across domains"
+@timed_node()
+def _terms_only_batch(state: typing.Any) -> dict:
+    """对每个 chunk 运行术语提取（不翻译），兼容 main.extract 的 process_chunk_terms_only 行为。"""
+    original = state
+    inner, parent, key = _unwrap(state)
+    sd: dict = typing.cast(dict, inner if isinstance(inner, dict) else {})
 
-    state = {
-        "text": text,
-        "candidates": [],
-        "terms": [],
-        "topic": topic,
-        "translations": {},
-        "final_translations": {},
+    summary = sd.get("summary", "")
+    chunks: Dict[str, str] = sd.get("chunks", {}) or {}
+
+    global _TERMS_ONLY_WORKFLOW
+    if _TERMS_ONLY_WORKFLOW is None:
+        try:
+            _TERMS_ONLY_WORKFLOW = build_graph_terms_only()
+        except Exception as e:
+            logger.exception("Failed to compile terms-only workflow in _terms_only_batch: %s", e)
+            _TERMS_ONLY_WORKFLOW = None
+
+    per_chunk_results: List[Dict[str, typing.Any]] = []
+    errors: List[Dict[str, str]] = []
+
+    # 使用线程池并发处理每个 chunk
+    def _process_one(cid: str, ctext: typing.Any) -> Dict[str, typing.Any]:
+        try:
+            text = ctext if isinstance(ctext, str) else str(ctext)
+            init_state = {
+                "text": text,
+                "candidates": [],
+                "terms": [],
+                "topic": summary,
+                "translations": {},
+                "final_translations": {},
+                "term_types": {},
+            }
+            if _TERMS_ONLY_WORKFLOW is None:
+                raise RuntimeError("terms_only_workflow_not_initialized")
+            raw_res = _TERMS_ONLY_WORKFLOW.invoke(init_state)
+            if isinstance(raw_res, dict):
+                result = raw_res
+            else:
+                result = {}
+            selected_terms = result.get("selected_terms") or result.get("terms") or []
+            term_types = result.get("term_types", {})
+            return {"chunk_id": str(cid), "terms": list(selected_terms), "term_types": dict(term_types)}
+        except Exception as e:
+            return {"chunk_id": str(cid), "terms": [], "term_types": {}, "error": str(e)}
+
+    if chunks:
+        max_workers = min(5, len(chunks))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_cid = {executor.submit(_process_one, cid, ctext): str(cid) for cid, ctext in chunks.items()}
+            for fut in as_completed(future_to_cid):
+                r = fut.result()
+                if r.get("error"):
+                    errors.append({"chunk_id": r.get("chunk_id"), "error": r.get("error")})
+                per_chunk_results.append(r)
+    else:
+        per_chunk_results = []
+
+    sd["per_chunk_results"] = per_chunk_results
+    sd.setdefault("errors", []).extend(errors)
+    return _rewrap(original, parent, key, sd)
+
+
+@timed_node()
+def _aggregate_unique_terms(state: typing.Any) -> dict:
+    original = state
+    inner, parent, key = _unwrap(state)
+    sd: dict = typing.cast(dict, inner if isinstance(inner, dict) else {})
+
+    all_terms: List[str] = []
+    for r in sd.get("per_chunk_results", []):
+        all_terms.extend(r.get("terms", []))
+    unique_terms = sorted(set(t for t in all_terms if isinstance(t, str) and t.strip()))
+    sd["unique_terms"] = unique_terms
+    return _rewrap(original, parent, key, sd)
+
+
+@timed_node()
+def _batch_translate_with_fallback(state: typing.Any) -> dict:
+    original = state
+    inner, parent, key = _unwrap(state)
+    sd: dict = typing.cast(dict, inner if isinstance(inner, dict) else {})
+
+    unique_terms: List[str] = sd.get("unique_terms", [])
+    translations_map: Dict[str, List[str]] = {}
+    topic = sd.get("summary", "")
+
+    # 批量翻译（使用线程池并行处理分批）
+    try:
+        if unique_terms:
+            batch_size = 50
+            batches = [unique_terms[i:i + batch_size] for i in range(0, len(unique_terms), batch_size)]
+            max_workers = min(5, len(batches))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(get_translation_candidates_batch, batch, batch_size=batch_size, topic=topic): idx
+                    for idx, batch in enumerate(batches)
+                }
+                for fut in as_completed(future_to_idx):
+                    idx = future_to_idx[fut]
+                    try:
+                        res = fut.result() or {}
+                        if isinstance(res, dict):
+                            translations_map.update(res)
+                        else:
+                            logger.warning("Batch %d returned non-dict result, ignored", idx)
+                    except Exception as e:
+                        logger.warning("Batch translation failed for batch %d: %s", idx, e)
+    except Exception as e:
+        logger.warning("Batch translation failed, will fallback to single + db: %s", e)
+        translations_map = {}
+
+    # 单项回退 + DB 回退
+    for t in unique_terms:
+        if translations_map.get(t):
+            continue
+        try:
+            single = translate_term_external(t, topic=topic) or []
+        except Exception:
+            single = []
+        if not single:
+            try:
+                local = query_term_translation(t) or []
+                single = local
+            except Exception:
+                pass
+        translations_map[t] = single or []
+
+    sd["translations_map"] = translations_map
+    return _rewrap(original, parent, key, sd)
+@timed_node()
+def _single_translate_concurrent(state: typing.Any) -> dict:
+    original = state
+    inner, parent, key = _unwrap(state)
+    sd: dict = typing.cast(dict, inner if isinstance(inner, dict) else {})
+
+    unique_terms: List[str] = sd.get("unique_terms", [])
+    topic = sd.get("summary", "")
+    translations_map: Dict[str, List[str]] = {}
+
+    if not unique_terms:
+        sd["translations_map"] = translations_map
+        return _rewrap(original, parent, key, sd)
+
+    # 可用并发数（你可根据 RPM 调整）
+    max_workers = 50
+
+    def worker(term: str):
+        """
+        单个词翻译任务，自动网络重试 3 次。
+        失败或未找到翻译 → 返回空列表。
+        """
+        retry_delays = [0.3, 0.6, 1.0]  # 渐进延迟
+
+        for attempt in range(3):
+            try:
+                res = translate_term(term, topic=topic)
+                if res:
+                    return term, res
+                else:
+                    # 找不到翻译不是网络错误，不必重试
+                    return term, []
+            except Exception as e:
+                logger.warning(
+                    "Translate attempt %d failed for %s: %s",
+                    attempt + 1, term, e
+                )
+                if attempt < 2:
+                    time.sleep(retry_delays[attempt])
+
+        # 三次都失败 → 给空列表
+        return term, []
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_term = {
+                executor.submit(worker, t): t for t in unique_terms
+            }
+
+            for fut in as_completed(future_to_term):
+                term = future_to_term[fut]
+                try:
+                    k, v = fut.result()
+                    translations_map[k] = v
+                except Exception as e:
+                    logger.warning("Unexpected translation failure for %s: %s", term, e)
+                    translations_map[term] = []
+
+    except Exception as e:
+        logger.exception("Concurrent translation failed: %s", e)
+        translations_map = {t: [] for t in unique_terms}
+
+    sd["translations_map"] = translations_map
+    return _rewrap(original, parent, key, sd)
+
+
+@timed_node()
+def _assemble_annotations(state: typing.Any) -> dict:
+    original = state
+    inner, parent, key = _unwrap(state)
+    sd: dict = typing.cast(dict, inner if isinstance(inner, dict) else {})
+
+    chunks: Dict[str, str] = sd.get("chunks", {}) or {}
+    per_chunk_results: List[Dict[str, typing.Any]] = sd.get("per_chunk_results", [])
+    translations_map: Dict[str, List[str]] = sd.get("translations_map", {})
+
+    per_chunk_map: Dict[str, Dict[str, typing.Any]] = {str(r.get("chunk_id")): r for r in per_chunk_results if r and r.get("chunk_id") is not None}
+
+    term_annotations: Dict[str, typing.Any] = {}
+    translated_count = 0
+
+    def _pick_best(term: str, cands: List[str]) -> str:
+        if not cands:
+            return "none"
+        # 忽略大小写和空格后与原词相同的候选
+        term_norm = term.strip().lower()
+        for c in cands:
+            if not c:
+                continue
+            c_norm = c.strip()
+            # 如果候选词与原词相同（忽略大小写），则跳过
+            if c_norm.lower() == term_norm:
+                continue
+            # 优先返回包含中文的翻译
+            if re.search(r"[\u4e00-\u9fff]", c_norm):
+                return c_norm
+        # 如果没有中文翻译，但有其他不同于原文的翻译
+        for c in cands:
+            if not c:
+                continue
+            c_norm = c.strip()
+            if c_norm.lower() != term_norm:
+                return c_norm
+        # 所有候选都与原词相同或为空
+        return "none"
+
+    for idx, cid in enumerate(chunks.keys(), start=1):
+        r = per_chunk_map.get(str(cid), {"terms": [], "term_types": {}})
+        items: List[Dict[str, typing.Any]] = []
+        for t in r.get("terms", []):
+            # 这里 t 是在 terms_only_workflow 中产生的，已保持原始大小写
+            cands = translations_map.get(t, [])
+            chosen = _pick_best(t, cands)
+            if chosen and chosen.lower() != "none":
+                translated_count += 1
+            # term 字段直接使用 t，不做 lower 处理
+            items.append({"term": t, "translation": chosen})
+        term_annotations[str(idx)] = items
+
+    stats = {
+        "total_chunks": len(chunks),
+        "unique_terms": len(sd.get("unique_terms", [])),
+        "translated_terms": translated_count,
     }
 
-    workflow = build_graph()
-    from typing import Any
-    result: Any = workflow.invoke(state)  # type: ignore
-
-    print("✅ 候选词数量:", len(result["candidates"]))
-    print("✅ 翻译候选:", result.get("translations"))
-    print("✅ 最终翻译:", result.get("final_translations"))
-    # debug counters
-    try:
-        print("LLM_CALLS:", LLM_CALLS)
-        print("DICT_CALLS:", DICT_CALLS)
-    except Exception:
-        pass
+    sd["termAnnotations"] = term_annotations
+    sd["stats"] = stats
+    return _rewrap(original, parent, key, sd)
 
 
+@timed_node()
+def build_graph():
+    """构建与 main.extract 等价的批处理图。
+
+    输入状态需要包含：
+    - summary: Optional[str]
+    - chunks: Dict[str, str]
+
+    输出（写入状态）：
+    - termAnnotations: Dict[str, Any]
+    - stats: Dict[str, Any]
+    - errors: List[Dict[str,str]]（若存在）
+    - 以及中间结果：per_chunk_results, unique_terms, translations_map
+    """
+    graph = StateGraph(dict)  # type: ignore
+    graph.add_node("extract_candidates", extract_candidates)  # type: ignore
+    # 新增先选择 top-N 的节点
+    graph.add_node("select_top_terms", select_top_terms)  # type: ignore
+
+    # 最终翻译选择器
+    graph.add_node("finalize_translations", finalize_translations)  # type: ignore
+    graph.add_node("init", _init_extract_state)  # type: ignore
+    graph.add_node("terms_only_batch", _terms_only_batch)  # type: ignore
+    graph.add_node("aggregate_unique_terms", _aggregate_unique_terms)  # type: ignore
+    graph.add_node("batch_translate", _single_translate_concurrent)  # type: ignore
+    graph.add_node("assemble_annotations", _assemble_annotations)  # type: ignore
+
+    graph.set_entry_point("init")
+    graph.add_edge("init", "terms_only_batch")
+    graph.add_edge("terms_only_batch", "aggregate_unique_terms")
+    graph.add_edge("aggregate_unique_terms", "batch_translate")
+    graph.add_edge("batch_translate", "assemble_annotations")
+    graph.add_edge("assemble_annotations", END)
+    return graph.compile()
 # ===================== 新增：仅执行术语提取与筛选，不做翻译的工作流 =====================
 @timed_node()
 def build_graph_terms_only():
     """仅执行术语提取与筛选，不做翻译，便于后置批量翻译。"""
     graph = StateGraph(dict)  # type: ignore
     graph.add_node("extract_candidates", extract_candidates)  # type: ignore
-    graph.add_node("filter_terms", filter_terms)  # type: ignore
+    # 直接使用 select_top_terms，不再依赖 filter_terms
     graph.add_node("select_top_terms", select_top_terms)  # type: ignore
     graph.set_entry_point("extract_candidates")
-    graph.add_edge("extract_candidates", "filter_terms")
-    graph.add_edge("filter_terms", "select_top_terms")
+    graph.add_edge("extract_candidates", "select_top_terms")
     graph.add_edge("select_top_terms", END)
     return graph.compile()
-
