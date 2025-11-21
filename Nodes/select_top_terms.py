@@ -30,8 +30,6 @@ def call_segment(seg_terms: list[str], reason: str, topic: str) -> list[str]:
         try:
             prompt = _build_prompt(seg_terms, reason, topic)
             completion = LLMclientManager.chat(
-                client_name="zhipu",
-                model="GLM-4-Flash",
                 messages=[
                     {"role": "system", "content": "只返回json列表，不要使用 ```json ``` 或其他格式，不要加解释。"},
                     {"role": "user", "content": prompt}

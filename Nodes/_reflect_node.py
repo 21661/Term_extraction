@@ -34,7 +34,7 @@ def build_reflect_prompt_batch(topic: str, batch_terms: List[str]) -> str:
     4. 拼写错误极大以至于无法正常翻译的词语（可以被识别出的微小错误可以忽略）
     
     - "pass": 如果所有词语都合格，则为 true，否则为 false
-    - "reason": 对每一个词语给出简洁明确的理由，无论是否认为通过筛选
+    - "reason": 对每一个词语给出简洁明确的理由，无论是否认为通过筛选,reason返回形式应该为字符串
     - "remove_terms": 所有需要删除的词语
 
     参照以下 JSON 格式返回（注意必须使用双引号）：
@@ -59,8 +59,6 @@ def call_segment(selected_terms: List[str],  topic: str) -> Dict[str, Any]:
         try:
             prompt = build_reflect_prompt_batch(topic, selected_terms)
             completion = LLMclientManager.chat(
-                client_name="zhipu",
-                model="glm-4.5-air",
                 messages=[
                     {"role": "system", "content": "你必须返回纯JSON"},
                     {"role": "user", "content": prompt},
@@ -120,6 +118,8 @@ def reflect_sync_node(state: TermState, maxRetry: int = 2) -> TermState:
 
     pass_flag = bool(parsed.get("pass", False))
     reason = parsed.get("reason", "无")
+    if(isinstance(reason, list)):
+        reason = "; ".join(reason)
     remove_terms = parsed.get("remove_terms", [])
     print(pass_flag, reason, remove_terms)
     return typing.cast(TermState,

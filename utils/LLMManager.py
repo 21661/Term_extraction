@@ -5,8 +5,6 @@ from langchain_openai import ChatOpenAI
 # 2. 使用 Pydantic 定义数据模型
 from pydantic import BaseModel, Field, HttpUrl, ValidationError
 
-# --- 请求和响应模型 ---
-# --- 请求和响应模型 ---
 class LLMConfigModel(BaseModel):
     """定义单个LLM的配置模型"""
     name: str

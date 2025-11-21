@@ -4,7 +4,7 @@ from langgraph.graph import StateGraph, END
 import spacy, json, time, logging, re
 from utils.LLMClientManager import LLMclientManager
 from utils.Get_term import (
-    translate_term,
+    translate_term, get_translation_candidates_batch,
 )
 from utils.workflow_adapter import _unwrap
 from utils.TimeNode import timed_node
@@ -63,6 +63,7 @@ def _aggregate_unique_terms(state: TermState) -> TermState:
     logger.info("Aggregated %d unique terms from chunks for translation.", len(unique_terms))
     return typing.cast(TermState, {"unique_terms": unique_terms})
 
+
 @timed_node()
 def _single_translate_concurrent(state: TermState) -> TermState:
     original: TermState | tuple | dict = state
@@ -76,40 +77,112 @@ def _single_translate_concurrent(state: TermState) -> TermState:
     if not unique_terms:
         return typing.cast(TermState, {"translations_map": translations_map})
 
-    max_workers = 150
+    # 1. 检查是否存在高并发的 MT 模型
+    target_mt_model = "tencent/Hunyuan-MT-7B"
+    has_mt_model = LLMclientManager.check_model_exists(target_mt_model)
 
-    def worker(term: str):
-        retry_delays = [0.3, 0.6, 1.0]
-        for attempt in range(3):
-            try:
-                res = translate_term(term, topic=topic)
-                if res:
-                    return term, res
-                return term, []
-            except Exception as e:
-                logger.warning("Translate attempt %d failed for %s: %s", attempt + 1, term, e)
-                if attempt < 2:
-                    time.sleep(retry_delays[attempt])
-        return term, []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    try:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_term = {executor.submit(worker, t): t for t in unique_terms}
-            for fut in as_completed(future_to_term):
-                term = future_to_term[fut]
+    if has_mt_model:
+        # =====================================================
+        # 分支 A: 使用 MT 模型 (高并发单词模式)
+        # 适用场景：专用于翻译的模型，支持超高并发，单次请求延迟极低
+        # =====================================================
+        logger.info(f"检测到 MT 模型 {target_mt_model}，启用【单词高并发】模式。")
+        max_workers = 100
+
+        def worker_single(term: str):
+            # 这里沿用你之前的单词重试逻辑
+            retry_delays = [0.3, 0.6, 1.0]
+            for attempt in range(3):
                 try:
-                    k, v = fut.result()
-                    translations_map[k] = v
+                    res = translate_term(term, topic=topic)
+                    if res:
+                        return term, res
+                    if attempt < 2:
+                        time.sleep(retry_delays[attempt])
                 except Exception as e:
-                    logger.warning("Unexpected translation failure for %s: %s", term, e)
-                    translations_map[term] = []
-    except Exception as e:
-        logger.exception("Concurrent translation failed: %s", e)
-        translations_map = {t: [] for t in unique_terms}
-    print(f"Completed translations_map", translations_map)
-    return typing.cast(TermState, {"translations_map": translations_map})
+                    logger.warning(f"Translate attempt {attempt + 1} failed for {term}: {e}")
+                    if attempt < 2:
+                        time.sleep(retry_delays[attempt])
+            return term, []
 
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_term = {executor.submit(worker_single, t): t for t in unique_terms}
+                for fut in as_completed(future_to_term):
+                    term = future_to_term[fut]
+                    try:
+                        k, v = fut.result()
+                        translations_map[k] = v
+                    except Exception as e:
+                        logger.warning(f"Single translation failure for {term}: {e}")
+                        translations_map[term] = []
+        except Exception as e:
+            logger.exception("Concurrent single translation failed: %s", e)
+
+    else:
+        # =====================================================
+        # 分支 B: 使用通用模型 (分块并发模式)
+        # 适用场景：GLM/GPT等通用模型，RPM有限，但Context Window较大，适合打包处理
+        # =====================================================
+        logger.info("未找到 MT 模型，启用【分块并发批量】模式。")
+
+        # 配置参数：通用模型并发不宜过高，避免 429
+        max_workers = 8  # 并发线程数
+        batch_size = 15  # 每个线程处理的词数
+
+        # 辅助函数：将列表分块
+        def chunk_list(lst, n):
+            for i in range(0, len(lst), n):
+                yield lst[i:i + n]
+
+        # 创建分块任务列表
+        term_chunks = list(chunk_list(unique_terms, batch_size))
+        logger.info(
+            f"共 {len(unique_terms)} 个术语，分为 {len(term_chunks)} 个批次 (Batch Size: {batch_size})，并发数: {max_workers}")
+
+        def worker_batch(terms_chunk: List[str]):
+            # 直接调用你 Get_term.py 里的批量函数
+            # 该函数内部会处理本地库查询和 LLM JSON解析
+            try:
+                # 注意：这里调用 get_translation_candidates_batch
+                # 即使传入 batch_size，因为我们切分后的 chunk 长度本身就等于 batch_size，
+                # 所以该函数内部通常只会发一次 LLM 请求
+                return get_translation_candidates_batch(terms_chunk, batch_size=batch_size, topic=topic)
+            except Exception as e:
+                logger.error(f"Batch worker failed: {e}")
+                return {t: [] for t in terms_chunk}
+
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交分块任务
+                futures = [executor.submit(worker_batch, chunk) for chunk in term_chunks]
+
+                for fut in as_completed(futures):
+                    try:
+                        batch_result = fut.result()  # 返回的是 Dict[str, List[str]]
+                        # 将批量结果合并到主字典中
+                        translations_map.update(batch_result)
+                    except Exception as e:
+                        logger.exception("Unexpected error in batch translation future")
+
+        except Exception as e:
+            logger.exception("Concurrent batch translation failed: %s", e)
+            # 兜底：确保所有词都有键
+            for t in unique_terms:
+                if t not in translations_map:
+                    translations_map[t] = []
+
+    # 最终检查，防止漏词
+    missing_count = 0
+    for t in unique_terms:
+        if t not in translations_map:
+            translations_map[t] = []
+            missing_count += 1
+
+    print(f"Completed translations_map. Total: {len(translations_map)}, Missing filled: {missing_count}")
+    return typing.cast(TermState, {"translations_map": translations_map})
 
 @timed_node()
 def _assemble_annotations(state: TermState) -> TermState:
@@ -162,6 +235,8 @@ def _assemble_annotations(state: TermState) -> TermState:
         items = []
         for t in terms:
             cands = lookup_candidates(t)
+            if cands is None:
+                continue
             chosen = _pick_best(t, cands)
 
             # --- 修改核心 ---

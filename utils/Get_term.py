@@ -39,73 +39,6 @@ def _decide_translation_method(term: str) -> str:
         return "llm"
     return "dict"
 
-def _extract_completion_text(completion) -> str:
-    try:
-        if isinstance(completion, dict):
-            def _find_text(obj):
-                if isinstance(obj, dict):
-                    for k in ("content", "text", "message"):
-                        if k in obj and isinstance(obj[k], str) and obj[k].strip():
-                            return obj[k].strip()
-                    for v in obj.values():
-                        res = _find_text(v)
-                        if res:
-                            return res
-                elif isinstance(obj, list):
-                    for item in obj:
-                        res = _find_text(item)
-                        if res:
-                            return res
-                return None
-
-            res = _find_text(completion)
-            return res or ""
-
-        choices = getattr(completion, 'choices', None)
-        if choices and len(choices) > 0:
-            first = choices[0]
-            if isinstance(first, dict):
-                msg = first.get('message') or first.get('text') or {}
-                if isinstance(msg, dict):
-                    return (msg.get('content') or msg.get('text') or "").strip()
-                return str(msg).strip()
-
-            msg = getattr(first, 'message', None) or getattr(first, 'text', None)
-            if isinstance(msg, dict):
-                return (msg.get('content') or msg.get('text') or "").strip()
-            if msg is not None:
-                try:
-                    s = str(
-                        getattr(msg, 'content', None) or getattr(msg, 'text', None)
-                    ).strip()
-                    if s:
-                        return s
-                except Exception:
-                    pass
-
-            for attr in ('content', 'text', 'delta'):
-                v = getattr(first, attr, None)
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
-                if v is not None:
-                    try:
-                        s = str(v).strip()
-                        if s:
-                            return s
-                    except Exception:
-                        pass
-
-        top = getattr(completion, 'text', None)
-        if isinstance(top, str) and top.strip():
-            return top.strip()
-
-        return ""
-    except Exception as err:
-        logger.debug("_extract_completion_text error: %s", err)
-        try:
-            return str(completion)
-        except Exception:
-            return ""
 
 # ---------------- LLM 调用：按 topic 返回单一最佳释义 ----------------
 
@@ -119,13 +52,12 @@ def _fetch_llm_translation(term: str, topic: Optional[str] = None, retries: int 
     for attempt in range(1, retries + 1):
         try:
             # ⭐ 不再 get_client_by_model
-            resp = LLMclientManager.chat(
-                client_name="siliconflow",   # 自动根据 model 匹配配置
-                model="tencent/Hunyuan-MT-7B",
+            resp = LLMclientManager.chat(   # 自动根据 model 匹配配置
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
+                model="tencent/Hunyuan-MT-7B",
             )
 
             # ⭐ LangChain 的返回结构
@@ -153,67 +85,63 @@ def _fetch_llm_translation(term: str, topic: Optional[str] = None, retries: int 
     return []
 
 
-# def _fetch_llm_translation_batch(terms: List[str], topic: Optional[str] = None, retries: int = 2, backoff: float = 1.0) -> Dict[str, List[str]]:
-#     if not terms:
-#         return {}
-#
-#     sys_prompt = (
-#         "你会收到一个包含'terms'字段的 JSON 对象。"
-#         "请将'terms'列表中的每个术语翻译成最贴切的中文。"
-#         "你必须返回一个 JSON 对象，其中的键是原始英文术语，值是对应的中文翻译。"
-#         "如果某个术语无法翻译，请在返回的 JSON 中省略该术语"
-#     )
-#
-#     input_data = {"terms": terms}
-#     user_prompt = json.dumps(input_data, ensure_ascii=False)
-#
-#     for attempt in range(1, retries + 1):
-#         try:
-#             client = LLMClientManager.get_client_by_model("tencent/Hunyuan-MT-7B")
-#             if not client:
-#                 logger.error("无法获取 tencent/Hunyuan-MT-7B 模型的客户端。")
-#                 return {t: [] for t in terms}
-#
-#             completion = client.chat.completions.create(
-#                 model="tencent/Hunyuan-MT-7B",
-#                 messages=[
-#                     {"role": "system", "content": sys_prompt},
-#                     {"role": "user", "content": user_prompt},
-#                 ],
-#                 temperature=0.2,
-#             )
-#
-#             raw_text = _extract_completion_text(completion)
-#             if not raw_text:
-#                 continue
-#
-#             # 提取 JSON
-#             try:
-#                 json_match = re.search(r"```json\n({.*})\n```", raw_text, re.DOTALL)
-#                 if json_match:
-#                     json_str = json_match.group(1)
-#                 else:
-#                     json_str = raw_text
-#
-#                 parsed_json = json.loads(json_str)
-#                 result: Dict[str, List[str]] = {}
-#
-#                 for term, translation in parsed_json.items():
-#                     if isinstance(translation, str) and translation.strip():
-#                         result[term] = [translation.strip()]
-#
-#                 for t in terms:
-#                     result.setdefault(t, [])
-#                 return result
-#             except json.JSONDecodeError:
-#                 logger.warning("LLM 批量翻译返回的 JSON 无效: %s", raw_text)
-#                 continue
-#
-#         except Exception as e:
-#             logger.warning("LLM 批量翻译失败 attempt %d: %s", attempt, e)
-#             time.sleep(backoff * attempt)
-#
-#     return {t: [] for t in terms}
+def _fetch_llm_translation_batch(terms: List[str], topic: Optional[str] = None, retries: int = 2, backoff: float = 1.0) -> Dict[str, List[str]]:
+    if not terms:
+        return {}
+
+    sys_prompt = (
+        "你是一个专业的中英文翻译助手。"
+        "你必须返回一个 JSON 对象，其中的键是原始英文术语，值是对应的中文翻译。"
+    )
+
+    input_data = {"terms": terms}
+    Input_json = json.dumps(input_data, ensure_ascii=False)
+    user_prompt = f"""
+        翻译对象：“{Input_json}”
+        任务描述：
+        "请将翻译对象列表中的每个术语翻译成最贴切的中文。"
+        "返回一个 JSON 对象，其中的键是原始英文术语，值是对应的中文翻译。"
+        """
+
+    for attempt in range(1, retries + 1):
+        try:
+            completion = LLMclientManager.chat(
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+
+            raw_text = (completion.content or "").strip()
+            if not raw_text:
+                continue
+
+            try:
+                json_match = re.search(r"```json\n({.*})\n```", raw_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    json_str = raw_text
+
+                parsed_json = json.loads(json_str)
+                result: Dict[str, List[str]] = {}
+
+                for term, translation in parsed_json.items():
+                    if isinstance(translation, str) and translation.strip():
+                        result[term] = [translation.strip()]
+
+                for t in terms:
+                    result.setdefault(t, [])
+                return result
+            except json.JSONDecodeError:
+                logger.warning("LLM 批量翻译返回的 JSON 无效: %s", raw_text)
+                continue
+
+        except Exception as e:
+            logger.warning("LLM 批量翻译失败 attempt %d: %s", attempt, e)
+            time.sleep(backoff * attempt)
+
+    return {t: [] for t in terms}
 
 def _clean_translation_text(text: str) -> str:
     return re.sub(r'[\(（][^)）]*[\)）]', '', text).strip()
@@ -238,44 +166,42 @@ def _get_translation_candidates(term: str, topic: Optional[str] = None) -> List[
 
     return cleaned
 
-# def get_translation_candidates_batch(terms: List[str], batch_size: int = 50, topic: Optional[str] = None) -> Dict[str, List[str]]:
-#     result: Dict[str, List[str]] = {}
-#     llm_terms: List[str] = []
-#
-#     # Step 1: 本地库
-#     for term in terms:
-#         local = query_term_translation(term)
-#         if local:
-#             result[term] = [local[0]]
-#         else:
-#             llm_terms.append(term)
-#
-#     # Step 2: LLM
-#     if llm_terms:
-#         for i in range(0, len(llm_terms), batch_size):
-#             batch = llm_terms[i:i + batch_size]
-#             llm_results = _fetch_llm_translation_batch(batch, topic=topic)
-#             for term, candidates in llm_results.items():
-#                 result[term] = candidates or []
-#
-#     # Step 3: fallback → 原文
-#     for term, candidates in result.items():
-#         cleaned = []
-#         seen = set()
-#         for c in (candidates or []):
-#             c2 = c.strip()
-#             if c2 and c2 not in seen:
-#                 seen.add(c2)
-#                 cleaned.append(c2)
-#
-#         if cleaned:
-#             result[term] = cleaned[:1]
-#         else:
-#             result[term] = [term]
-#
-#     return result
+def get_translation_candidates_batch(terms: List[str], batch_size: int = 50, topic: Optional[str] = None) -> Dict[str, List[str]]:
+    result: Dict[str, List[str]] = {}
+    llm_terms: List[str] = []
 
-# ------------------ 单术语翻译 ------------------
+    # Step 1: 本地库
+    for term in terms:
+        local = query_term_translation(term)
+        if local:
+            result[term] = [local[0]]
+        else:
+            llm_terms.append(term)
+
+    # Step 2: LLM
+    if llm_terms:
+        for i in range(0, len(llm_terms), batch_size):
+            batch = llm_terms[i:i + batch_size]
+            llm_results = _fetch_llm_translation_batch(batch, topic=topic)
+            for term, candidates in llm_results.items():
+                result[term] = candidates or []
+
+    # Step 3: fallback → 原文
+    for term, candidates in result.items():
+        cleaned = []
+        seen = set()
+        for c in (candidates or []):
+            c2 = c.strip()
+            if c2 and c2 not in seen:
+                seen.add(c2)
+                cleaned.append(c2)
+
+        if cleaned:
+            result[term] = cleaned[:1]
+        else:
+            result[term] = [term]
+
+    return result
 
 def translate_term(term_en: str, topic: Optional[str] = None) -> List[str]:
     """
@@ -287,10 +213,8 @@ def translate_term(term_en: str, topic: Optional[str] = None) -> List[str]:
     local = query_term_translation(term_en)
     if local:
         return [local[0]]
-
     # LLM
     candidates = _get_translation_candidates(term_en, topic=topic)
-
     # fallback
     if not candidates:
         logger.info("未找到 %s 的任何翻译，返回英文原文。", term_en)
