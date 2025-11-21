@@ -122,7 +122,19 @@ class LLMClientManager:
                     raise ValueError(f"未找到模型 '{target_model}' 的配置。当前可用模型: {available_models}")
             else:
                 # 如果没指定模型，从所有配置中随机 (混用模式)
-                candidates = list(self._clients.keys())
+                config_response = self.agent_manager.get_config()
+                llm_configs = config_response.llms if config_response else []
+
+                config_type_map = {
+                    cfg.name: (cfg.extra_body or {}).get("type")
+                    for cfg in llm_configs
+                }
+
+                # 3. 生成 candidates，排除 type 为 "MT" 的项
+                candidates = [
+                    cid for cid in self._clients.keys()
+                    if config_type_map.get(cid) != "MT"
+                ]
 
             # 2. 筛选未满载的 ID
             valid_candidates = []

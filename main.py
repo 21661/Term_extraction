@@ -10,9 +10,6 @@ from graph import build_graph
 from utils.LLMManager import AgentManager, AgentConfigRequestModel, LLMConfigModel, AgentConfigResponseModel
 from utils.LLMClientManager import LLMclientManager
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
 
 app = FastAPI(title="Term Extraction API")
 logger = logging.getLogger(__name__)

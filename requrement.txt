@@ -3,7 +3,6 @@ uvicorn==0.38.0
 langchain==1.0.3
 langgraph==1.0.2
 openai==2.6.1
-zhipuai==2.1.5.20250825
 transformers==4.57.1
 torch==2.9.0
 sentence-transformers==5.1.2
@@ -13,12 +12,5 @@ numpy==2.3.4
 scipy==1.16.3
 requests==2.32.5
 pydantic==2.12.3
-beautifulsoup4==4.14.2
-jinja2==3.1.6
 tqdm==4.67.1
-rich==14.2.0
-zai-0.0.2
 langchain_openai-1.0.3 tiktoken-0.12.0
-asgiref
-aiofiles
-dotenv

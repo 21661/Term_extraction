@@ -46,21 +46,21 @@ def _terms_only_batch(state: TermState) -> TermState:
             s1["candidates"] = cleaned
 
             # 3) select_top_terms
-            inner_state = s1.get("inner") or s1
-            if "terms" not in inner_state:
-                inner_state["terms"] = cleaned
+            # inner_state = s1.get("inner") or s1
+            # if "terms" not in inner_state:
+            #     inner_state["terms"] = cleaned
+            #
+            # s2 = select_top_terms(inner_state)
+            # terms = s2.get("selected_terms") or []
 
-            s2 = select_top_terms(inner_state)
-            terms = s2.get("selected_terms") or []
-
-            return {"chunk_id": str(cid), "terms": terms}
+            return {"chunk_id": str(cid), "terms": cleaned}
 
         except Exception as e:
             return {"chunk_id": str(cid), "terms": [], "error": str(e)}
 
     # 并发执行
     if chunks:
-        max_workers = min(4, len(chunks))
+        max_workers = min(20, len(chunks))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_cid = {
                 executor.submit(process_chunk, cid, ctext): cid
