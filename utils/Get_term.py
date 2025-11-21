@@ -199,7 +199,7 @@ def get_translation_candidates_batch(terms: List[str], batch_size: int = 50, top
         if cleaned:
             result[term] = cleaned[:1]
         else:
-            result[term] = [term]
+            result[term] = []
 
     return result
 
@@ -218,6 +218,6 @@ def translate_term(term_en: str, topic: Optional[str] = None) -> List[str]:
     # fallback
     if not candidates:
         logger.info("未找到 %s 的任何翻译，返回英文原文。", term_en)
-        return [term_en]
+        return []
 
     return candidates[:1]

@@ -184,7 +184,7 @@ def _single_translate_concurrent(state: TermState) -> TermState:
     print(f"Completed translations_map. Total: {len(translations_map)}, Missing filled: {missing_count}")
     return typing.cast(TermState, {"translations_map": translations_map})
 
-@timed_node()
+
 def _assemble_annotations(state: TermState) -> TermState:
     import re
     original = state
@@ -198,35 +198,37 @@ def _assemble_annotations(state: TermState) -> TermState:
     def lookup_candidates(t: str):
         key_raw = t
         key_lower = t.lower().strip()
-        # 简单的归一化查找
         return (
                 translations_map.get(key_raw) or
                 translations_map.get(key_lower) or
                 []
         )
 
-    def _pick_best(term: str, cands: List[str]) -> str:
+    # --- 修改点 1：_pick_best 逻辑修正 ---
+    def _pick_best(term: str, cands: List[str]) -> typing.Optional[str]:
+        # 只有当完全没有候选词时，才视为“失败”，返回 None
         if not cands:
-            return term  # 如果没有翻译，返回原词
+            return None
+
+        filtered = [c.strip() for c in cands if c and c.strip()]
+        if not filtered:
+            return None
 
         term_norm = term.strip().lower()
-        filtered = [c.strip() for c in cands if c and c.strip()]
 
-        # 1. 优先找中文 (Unicode范围)
+        # 优先策略不变：先找中文
         for c in filtered:
             if re.search(r"[\u4e00-\u9fff]", c):
                 return c
 
-        # 2. 找非中文但内容不同的 (比如全称扩展)
+        # 其次：找和原文不一样的（比如全称扩展）
         for c in filtered:
             if c.lower() != term_norm:
                 return c
 
-        # 3. 如果只有相同的词（比如 Docling -> Docling），也返回它
-        if filtered:
-            return filtered[0]
-
-        return term
+        # 【关键修正】：如果只剩下和原文一样的词（例如 AVL -> AVL），直接返回它
+        # 只要翻译表里有它，就说明它是有效结果
+        return filtered[0]
 
     for chunk_item in per_chunk_results:
         cid = chunk_item.get("chunk_id")
@@ -235,21 +237,23 @@ def _assemble_annotations(state: TermState) -> TermState:
         items = []
         for t in terms:
             cands = lookup_candidates(t)
-            if cands is None:
-                continue
+
+            # 这里的 cands 如果是 []，_pick_best 会返回 None
             chosen = _pick_best(t, cands)
 
-            # --- 修改核心 ---
-            # 移除 if chosen != t 的判断
-            # 只要这个词被选中了，无论是否有翻译变化，都应该输出
+            # --- 修改点 2：只过滤 None ---
+            if chosen is None:
+                # 说明翻译表里根本没这个词（或者值是空的），跳过
+                continue
+
             items.append({"term": t, "translation": chosen})
-            # ---------------
+            # ---------------------------
 
-        term_annotations[str(cid)] = items
-
+        if items:
+            term_annotations[str(cid)] = items
 
     print(f"Assembled term_annotations: {term_annotations}")
-    return typing.cast(TermState, {"term_annotations": term_annotations})  # 注意这里 key 修正为 term_annotations 保持一致
+    return typing.cast(TermState, {"term_annotations": term_annotations})
 
 
 
