@@ -1,7 +1,8 @@
 import random
 import logging
 import threading
-from typing import Dict, List
+import asyncio
+from typing import Dict, List, Set
 from contextlib import contextmanager
 
 from langchain_openai import ChatOpenAI
@@ -14,13 +15,15 @@ logger = logging.getLogger(__name__)
 class LLMClientManager:
     _instance = None
 
-    # 存储实际的客户端对象: { "config_id_name": ClientInstance }
+    # 存储实际的客户端对象
     _clients: Dict[str, ChatOpenAI] = {}
     _async_clients: Dict[str, ChatOpenAI] = {}
 
     # 核心索引：模型名 -> 配置ID列表
-    # 例: { "MiniMax-M2": ["account_1", "account_2"], "GLM-4": ["zhipu_main"] }
     _model_index: Dict[str, List[str]] = {}
+
+    # MT 模型 ID 集合 (用于随机选择时排除)
+    _mt_client_ids: Set[str] = set()
 
     # 并发控制
     _concurrency_limits: Dict[str, int] = {}
@@ -38,13 +41,13 @@ class LLMClientManager:
         with self._lock:
             self._clients.clear()
             self._async_clients.clear()
-            self._model_index.clear()  # 清空索引
+            self._model_index.clear()
             self._concurrency_limits.clear()
             self._active_counts.clear()
+            self._mt_client_ids.clear()
             logger.info("LLMClientManager: 状态已重置")
 
     def _initialize_clients(self):
-        """根据配置初始化，并建立 [模型名 -> 配置ID] 的索引"""
         if self._clients: return
 
         config = self.agent_manager.get_config()
@@ -56,30 +59,33 @@ class LLMClientManager:
 
             for llm_config in config.llms:
                 try:
-                    # 1. 唯一标识符 (用户配置的 name, 如 "zhipu-1")
                     client_id = llm_config.name
-                    # 2. 实际模型名 (如 "GLM-4.5-Flash")
                     real_model_name = llm_config.model_name
 
-                    # 初始化 LangChain 客户端
+                    # 设置 max_retries=0，禁止底层自动重试，交由上层换号逻辑处理
                     client = ChatOpenAI(
                         model=real_model_name,
                         api_key=llm_config.api_key,
                         base_url=llm_config.base_url,
                         temperature=llm_config.temperature or 0.2,
                         extra_body=llm_config.extra_body,
+                        max_retries=0,
+                        request_timeout=60
                     )
 
                     self._clients[client_id] = client
                     self._async_clients[client_id] = client
 
-                    # --- 核心：构建索引 ---
                     if real_model_name not in self._model_index:
                         self._model_index[real_model_name] = []
                     self._model_index[real_model_name].append(client_id)
-                    # -------------------
 
-                    # 初始化并发限制
+                    # 识别 MT 模型
+                    extra_body = llm_config.extra_body or {}
+                    if extra_body.get("type") == "MT":
+                        self._mt_client_ids.add(client_id)
+
+                    # 并发限制
                     max_concurrency = 1
                     if llm_config.extra_config:
                         max_concurrency = llm_config.extra_config.get("max_concurrency", 1)
@@ -90,53 +96,35 @@ class LLMClientManager:
                     logger.error(f"初始化失败 [{llm_config.name}]: {e}")
 
     def check_model_exists(self, model_name: str) -> bool:
-        """
-        检查是否存在指定 model_name 的配置 (精确匹配)。
-        :param model_name: 模型名称，如 "GLM-4.5-Flash"
-        :return: True / False
-        """
-        # 1. 确保系统已初始化 (因为是懒加载)
-        if not self._clients:
-            self._initialize_clients()
-
+        if not self._clients: self._initialize_clients()
         with self._lock:
-            # _model_index 的 Key 就是 JSON 中的 model_name
             return model_name in self._model_index
-    def _get_available_client_id(self, target_model: str = None) -> str:
-        """
-        根据传入的模型名，查找可用的 client_id
-        """
-        if not self._clients:
-            self._initialize_clients()
+
+    def _get_available_client_id(self, target_model: str = None, exclude_ids: List[str] = None) -> str:
+        if not self._clients: self._initialize_clients()
 
         with self._lock:
             candidates = []
 
-            # 1. 确定候选池
             if target_model:
-                # 如果指定了模型名，只从该模型的配置中找
+                # 指定模型：允许选中 MT (只要显式指定)
                 candidates = self._model_index.get(target_model, [])
                 if not candidates:
-                    # 如果没找到该模型，抛出明确错误
-                    available_models = list(self._model_index.keys())
-                    raise ValueError(f"未找到模型 '{target_model}' 的配置。当前可用模型: {available_models}")
+                    available = list(self._model_index.keys())
+                    raise ValueError(f"未找到模型 '{target_model}'。可用: {available}")
             else:
-                # 如果没指定模型，从所有配置中随机 (混用模式)
-                config_response = self.agent_manager.get_config()
-                llm_configs = config_response.llms if config_response else []
-
-                config_type_map = {
-                    cfg.name: (cfg.extra_body or {}).get("type")
-                    for cfg in llm_configs
-                }
-
-                # 3. 生成 candidates，排除 type 为 "MT" 的项
+                # 未指定模型：排除 MT
                 candidates = [
                     cid for cid in self._clients.keys()
-                    if config_type_map.get(cid) != "MT"
+                    if cid not in self._mt_client_ids
                 ]
 
-            # 2. 筛选未满载的 ID
+            # 排除刚才失败的 ID
+            if exclude_ids:
+                filtered = [c for c in candidates if c not in exclude_ids]
+                if filtered:
+                    candidates = filtered
+
             valid_candidates = []
             for cid in candidates:
                 limit = self._concurrency_limits.get(cid, 1)
@@ -145,13 +133,10 @@ class LLMClientManager:
                     valid_candidates.append(cid)
 
             if not valid_candidates:
-                msg = f"模型 '{target_model}'" if target_model else "系统"
-                raise RuntimeError(f"{msg} 所有实例均已满载 (Busy)，请稍后重试。")
+                msg = f"模型 '{target_model}'" if target_model else "通用模型池"
+                raise RuntimeError(f"{msg} 所有实例均已满载，请稍后重试。")
 
-            # 3. 随机负载均衡
             selected_id = random.choice(valid_candidates)
-
-            # 4. 增加计数
             self._active_counts[selected_id] += 1
             return selected_id
 
@@ -161,29 +146,22 @@ class LLMClientManager:
                 self._active_counts[client_id] -= 1
 
     @contextmanager
-    def _acquire_client_context(self, model: str = None, specific_client_id: str = None):
-        """
-        上下文管理器：负责获取资源 -> Yield Client -> 自动释放
-        """
+    def _acquire_client_context(self, model: str = None, specific_client_id: str = None, exclude_ids: List[str] = None):
         selected_id = None
 
-        # 优先级 1: 强制指定具体配置ID (调试用)
         if specific_client_id:
             if not self._clients: self._initialize_clients()
             selected_id = specific_client_id
             with self._lock:
                 self._active_counts[selected_id] = self._active_counts.get(selected_id, 0) + 1
-
-        # 优先级 2: 指定模型名 (常用，自动负载均衡)
-        # 优先级 3: 什么都不传 (随机)
         else:
-            selected_id = self._get_available_client_id(target_model=model)
+            selected_id = self._get_available_client_id(target_model=model, exclude_ids=exclude_ids)
 
         try:
             client = self._clients.get(selected_id)
             if not client:
-                raise RuntimeError(f"内部错误: 找不到 ID 为 '{selected_id}' 的客户端实例")
-            yield client
+                raise RuntimeError(f"Client {selected_id} not found")
+            yield client, selected_id
         finally:
             self._release_client_id(selected_id)
 
@@ -201,46 +179,65 @@ class LLMClientManager:
         return lc_msgs
 
     # ==========================================
-    # Public API
+    # Public API (无 reasoning 参数)
     # ==========================================
 
-    def chat(self, messages: list, model: str = None, client_name: str = None):
+    def chat(self, messages: list, model: str = None, client_name: str = None, max_retries: int = 3):
         """
         同步对话接口
-        :param model: (推荐) 目标模型名称，如 "GLM-4.5-Flash"。系统会自动在配置了该模型的所有Key中负载均衡。
-        :param client_name: (可选) 强制指定某个配置的 name。
         """
+        if not self._clients: self._initialize_clients()
         lc_msgs = self._convert_messages(messages)
-        # 将参数传给 Context Manager 处理选择逻辑
-        with self._acquire_client_context(model=model, specific_client_id=client_name) as client:
-            return client.invoke(lc_msgs)
 
-    async def achat(self, messages: list, model: str = None, client_name: str = None):
+        failed_ids = []
+        for attempt in range(max_retries + 1):
+            current_id = None
+            try:
+                with self._acquire_client_context(model=model, specific_client_id=client_name,
+                                                  exclude_ids=failed_ids) as (client, cid):
+                    current_id = cid
+                    return client.invoke(lc_msgs)
+            except Exception as e:
+                if current_id: failed_ids.append(current_id)
+                logger.warning(f"Chat重试 {attempt + 1}/{max_retries + 1} [ID:{current_id}]: {e}")
+                if client_name or attempt == max_retries: raise e
+
+    async def achat(self, messages: list, model: str = None, client_name: str = None, max_retries: int = 3):
         """
         异步对话接口
         """
-        if not self._async_clients:
-            self._initialize_clients()
-
+        if not self._async_clients: self._initialize_clients()
         lc_msgs = self._convert_messages(messages)
 
-        # 手动管理生命周期
-        selected_id = None
-        if client_name:
-            selected_id = client_name
-            with self._lock:
-                self._active_counts[selected_id] = self._active_counts.get(selected_id, 0) + 1
-        else:
-            # 这里传入 model，根据模型名选择 ID
-            selected_id = self._get_available_client_id(target_model=model)
+        failed_ids = []
+        for attempt in range(max_retries + 1):
+            current_id = None
+            try:
+                # 1. 获取 ID
+                if client_name:
+                    current_id = client_name
+                    with self._lock:
+                        self._active_counts[current_id] = self._active_counts.get(current_id, 0) + 1
+                else:
+                    current_id = self._get_available_client_id(target_model=model, exclude_ids=failed_ids)
 
-        try:
-            client = self._async_clients.get(selected_id)
-            if not client:
-                raise RuntimeError(f"Client {selected_id} not found")
-            return await client.ainvoke(lc_msgs)
-        finally:
-            self._release_client_id(selected_id)
+                # 2. 获取 Client
+                client = self._async_clients.get(current_id)
+                if not client: raise RuntimeError(f"Client {current_id} not found")
+
+                # 3. 执行
+                res = await client.ainvoke(lc_msgs)
+                self._release_client_id(current_id)
+                return res
+
+            except Exception as e:
+                if current_id:
+                    self._release_client_id(current_id)
+                    failed_ids.append(current_id)
+
+                logger.warning(f"AChat重试 {attempt + 1}/{max_retries + 1} [ID:{current_id}]: {e}")
+                if client_name or attempt == max_retries: raise e
+                await asyncio.sleep(0.5)
 
 
 LLMclientManager = LLMClientManager()

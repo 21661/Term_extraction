@@ -60,8 +60,13 @@ def _terms_only_batch(state: TermState) -> TermState:
             }
             for fut in as_completed(future_to_cid):
                 res = fut.result()
+
+                terms = res.get("terms", [])
+                keep = int(len(terms) * 0.8)
+                res["terms"] = terms[:keep]
+
                 per_chunk_results.append(res)
-                candidates.update(res.get("terms", []))
+                candidates.update(res["terms"])
 
     term_to_chunks = defaultdict(list)
     for r in per_chunk_results:

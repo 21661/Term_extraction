@@ -14,7 +14,6 @@ class LLMConfigModel(BaseModel):
     temperature: float = Field(default=0.1, description="模型的温度，控制创造性")
     # 将并发与速率限制移入 extra_config
     extra_config: Optional[Dict[str, Any]] = Field(default=None, description="额外的运行时配置，如 max_concurrency / rpm 等")
-
     extra_body: Optional[Dict[str, Any]] = Field(default=None, description="厂商自定义参数")
 
 

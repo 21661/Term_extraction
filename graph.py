@@ -1,10 +1,11 @@
+import asyncio
 from typing import List, Dict
 from langchain_core.runnables import Runnable
 from langgraph.graph import StateGraph, END
 import spacy, json, time, logging, re
 from utils.LLMClientManager import LLMclientManager
 from utils.Get_term import (
-    translate_term, get_translation_candidates_batch,
+     translate_batch_async, translate_term_async,
 )
 from utils.workflow_adapter import _unwrap
 from utils.TimeNode import timed_node
@@ -65,8 +66,10 @@ def _aggregate_unique_terms(state: TermState) -> TermState:
 
 
 @timed_node()
-def _single_translate_concurrent(state: TermState) -> TermState:
-    original: TermState | tuple | dict = state
+async def _single_translate_concurrent(state: TermState) -> TermState:
+    """
+    翻译节点（极致性能版）
+    """
     inner, parent, key = _unwrap(state)
     sd: TermState = typing.cast(TermState, inner if isinstance(inner, dict) else TermState())
 
@@ -77,111 +80,73 @@ def _single_translate_concurrent(state: TermState) -> TermState:
     if not unique_terms:
         return typing.cast(TermState, {"translations_map": translations_map})
 
-    # 1. 检查是否存在高并发的 MT 模型
+    # 检查是否有 MT 模型
     target_mt_model = "tencent/Hunyuan-MT-7B"
     has_mt_model = LLMclientManager.check_model_exists(target_mt_model)
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     if has_mt_model:
         # =====================================================
-        # 分支 A: 使用 MT 模型 (高并发单词模式)
-        # 适用场景：专用于翻译的模型，支持超高并发，单次请求延迟极低
+        # 策略 A: 单词高并发 (MT 模型)
         # =====================================================
-        logger.info(f"检测到 MT 模型 {target_mt_model}，启用【单词高并发】模式。")
-        max_workers = 100
+        logger.info(f"🚀 启用 MT 高并发模式 ({target_mt_model})")
 
-        def worker_single(term: str):
-            # 这里沿用你之前的单词重试逻辑
-            retry_delays = [0.3, 0.6, 1.0]
-            for attempt in range(3):
-                try:
-                    res = translate_term(term, topic=topic)
-                    if res:
-                        return term, res
-                    if attempt < 2:
-                        time.sleep(retry_delays[attempt])
-                except Exception as e:
-                    logger.warning(f"Translate attempt {attempt + 1} failed for {term}: {e}")
-                    if attempt < 2:
-                        time.sleep(retry_delays[attempt])
-            return term, []
+        # 信号量：控制同时飞在天上的请求数，防止 API 限流
+        # 建议根据你的 API 额度调整，100 是个激进但高效的值
+        semaphore = asyncio.Semaphore(100)
 
-        try:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_term = {executor.submit(worker_single, t): t for t in unique_terms}
-                for fut in as_completed(future_to_term):
-                    term = future_to_term[fut]
-                    try:
-                        k, v = fut.result()
-                        translations_map[k] = v
-                    except Exception as e:
-                        logger.warning(f"Single translation failure for {term}: {e}")
-                        translations_map[term] = []
-        except Exception as e:
-            logger.exception("Concurrent single translation failed: %s", e)
+        async def worker(term):
+            async with semaphore:
+                # 失败自动重试 2 次
+                for _ in range(2):
+                    res = await translate_term_async(term, topic, target_mt_model)
+                    if res: return term, res
+                    # 稍微退避一下
+                    # await asyncio.sleep(0.1)
+                return term, []
+
+        # 创建任务并发执行
+        tasks = [worker(t) for t in unique_terms]
+        results = await asyncio.gather(*tasks)
+
+        for term, res in results:
+            translations_map[term] = res
 
     else:
         # =====================================================
-        # 分支 B: 使用通用模型 (分块并发模式)
-        # 适用场景：GLM/GPT等通用模型，RPM有限，但Context Window较大，适合打包处理
+        # 策略 B: 批量分块 (通用模型)
         # =====================================================
-        logger.info("未找到 MT 模型，启用【分块并发批量】模式。")
+        logger.info("📦 启用通用模型批量模式")
 
-        # 配置参数：通用模型并发不宜过高，避免 429
-        max_workers = 8  # 并发线程数
-        batch_size = 15  # 每个线程处理的词数
+        batch_size = 20  # 通用模型一次处理 20 个词比较稳
+        max_concurrency = 10  # 控制并发数
 
-        # 辅助函数：将列表分块
-        def chunk_list(lst, n):
-            for i in range(0, len(lst), n):
-                yield lst[i:i + n]
+        semaphore = asyncio.Semaphore(max_concurrency)
 
-        # 创建分块任务列表
-        term_chunks = list(chunk_list(unique_terms, batch_size))
-        logger.info(
-            f"共 {len(unique_terms)} 个术语，分为 {len(term_chunks)} 个批次 (Batch Size: {batch_size})，并发数: {max_workers}")
+        # 切分列表
+        chunks = [unique_terms[i:i + batch_size] for i in range(0, len(unique_terms), batch_size)]
 
-        def worker_batch(terms_chunk: List[str]):
-            # 直接调用你 Get_term.py 里的批量函数
-            # 该函数内部会处理本地库查询和 LLM JSON解析
-            try:
-                # 注意：这里调用 get_translation_candidates_batch
-                # 即使传入 batch_size，因为我们切分后的 chunk 长度本身就等于 batch_size，
-                # 所以该函数内部通常只会发一次 LLM 请求
-                return get_translation_candidates_batch(terms_chunk, batch_size=batch_size, topic=topic)
-            except Exception as e:
-                logger.error(f"Batch worker failed: {e}")
-                return {t: [] for t in terms_chunk}
+        async def worker_batch(chunk):
+            async with semaphore:
+                for _ in range(2):  # 简单重试
+                    res = await translate_batch_async(chunk, topic)
+                    if res: return res
+                return {}
 
-        try:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # 提交分块任务
-                futures = [executor.submit(worker_batch, chunk) for chunk in term_chunks]
+        tasks = [worker_batch(c) for c in chunks]
+        results = await asyncio.gather(*tasks)
 
-                for fut in as_completed(futures):
-                    try:
-                        batch_result = fut.result()  # 返回的是 Dict[str, List[str]]
-                        # 将批量结果合并到主字典中
-                        translations_map.update(batch_result)
-                    except Exception as e:
-                        logger.exception("Unexpected error in batch translation future")
+        for batch_map in results:
+            if batch_map:
+                translations_map.update(batch_map)
 
-        except Exception as e:
-            logger.exception("Concurrent batch translation failed: %s", e)
-            # 兜底：确保所有词都有键
-            for t in unique_terms:
-                if t not in translations_map:
-                    translations_map[t] = []
-
-    # 最终检查，防止漏词
-    missing_count = 0
+    # 兜底检查
+    missing = 0
     for t in unique_terms:
         if t not in translations_map:
             translations_map[t] = []
-            missing_count += 1
+            missing += 1
 
-    print(f"Completed translations_map. Total: {len(translations_map)}, Missing filled: {missing_count}")
+    logger.info(f"翻译完成。总数: {len(translations_map)}, 补全空缺: {missing}")
     return typing.cast(TermState, {"translations_map": translations_map})
 
 
@@ -249,7 +214,7 @@ def _assemble_annotations(state: TermState) -> TermState:
             items.append({"term": t, "translation": chosen})
             # ---------------------------
 
-        if items:
+
             term_annotations[str(cid)] = items
 
     print(f"Assembled term_annotations: {term_annotations}")

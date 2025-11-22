@@ -1,15 +1,17 @@
 # main.py (simplified unified batch translation workflow via build_graph)
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import Any, Dict, Optional
 import uvicorn
 import logging
 from utils.db_interface import ensure_db_initialized
 from graph import build_graph
 from utils.LLMManager import AgentManager, AgentConfigRequestModel, LLMConfigModel, AgentConfigResponseModel
 from utils.LLMClientManager import LLMclientManager
-import os
+import uuid
+import time
+from enum import Enum
+from fastapi import BackgroundTasks, HTTPException
+from typing import Optional, Dict, Any
 
 app = FastAPI(title="Term Extraction API")
 logger = logging.getLogger(__name__)
@@ -63,29 +65,138 @@ class ExtractPayload(BaseModel):
     chunks: Dict[str, str] = Field(..., description="对象形式的段落集合：{id: text}")
 
 
-@app.post("/extract")
-def extract_sync(payload: ExtractPayload):
+class TaskStatus(str, Enum):
+    PENDING = "pending"  # 排队中
+    PROCESSING = "processing"  # 处理中
+    COMPLETED = "completed"  # 完成
+    FAILED = "failed"  # 失败
+
+
+# 全局任务存储 {task_id: dict}
+# 注意：服务重启后数据会丢失。生产环境建议使用 Redis。
+TASK_STORE: Dict[str, Dict[str, Any]] = {}
+
+
+# ==========================================
+# 2. 响应模型定义
+# ==========================================
+
+class TaskSubmitResponse(BaseModel):
+    task_id: str
+    message: str
+    status: TaskStatus
+
+
+class TaskResultResponse(BaseModel):
+    task_id: str  # 保持接口契约不变
+    status: TaskStatus
+    submitted_at: float
+    completed_at: Optional[float] = None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+# ==========================================
+# 3. 后台处理逻辑
+# ==========================================
+
+async def process_workflow_task(task_id: str, init_state: Dict[str, Any]):
     """
-    同步版本：直接调用同步 Graph。
+    后台运行 Workflow (异步模式)
+    """
+    try:
+        TASK_STORE[task_id]["status"] = TaskStatus.PROCESSING
+
+        if WORKFLOW is None:
+            raise RuntimeError("Workflow graph is not initialized.")
+
+        # === 2. 使用 await ainvoke ===
+        # 这会真正利用异步特性，并发执行你刚才优化的 reflect 节点
+        graph_result = await WORKFLOW.ainvoke(init_state)
+        # ============================
+
+        term_annotations = graph_result.get("term_annotations", {})
+
+        TASK_STORE[task_id]["result"] = {"term_annotations": term_annotations}
+        TASK_STORE[task_id]["status"] = TaskStatus.COMPLETED
+        TASK_STORE[task_id]["completed_at"] = time.time()
+        logger.info(f"Task {task_id} completed successfully.")
+
+    except Exception as e:
+        logger.exception(f"Task {task_id} failed: {e}")
+        TASK_STORE[task_id]["error"] = str(e)
+        TASK_STORE[task_id]["status"] = TaskStatus.FAILED
+        TASK_STORE[task_id]["completed_at"] = time.time()
+
+
+# ==========================================
+# 4. 接口定义
+# ==========================================
+
+@app.post("/extract", response_model=TaskSubmitResponse)
+async def extract_async(payload: ExtractPayload, background_tasks: BackgroundTasks):
+    """
+    [异步接口] 提交提取任务。
+    返回 task_id，客户端需通过 GET /extract/{task_id} 轮询结果。
     """
     if WORKFLOW is None:
-        return JSONResponse({"termAnnotations": {}})
+        raise HTTPException(status_code=503, detail="Workflow system not initialized")
 
+    # 1. 生成任务 ID
+    task_id = str(uuid.uuid4())
+
+    # 2. 准备 Workflow 初始状态
     init_state: Dict[str, Any] = {
         "summary": payload.summary or "",
         "chunks": payload.chunks or {},
     }
 
-    try:
-        result: Dict[str, Any] = WORKFLOW.invoke(init_state)  # 同步调用
-    except Exception as e:
-        logger.exception("Unified graph invocation failed: %s", e)
-        return JSONResponse({"term_annotations": {}})
-
-    resp: Dict[str, Any] = {
-        "term_annotations": result.get("term_annotations", {}),
+    # 3. 初始化任务记录
+    TASK_STORE[task_id] = {
+        "id": task_id,
+        "status": TaskStatus.PENDING,
+        "submitted_at": time.time(),
+        "result": None,
+        "error": None
     }
-    return JSONResponse(resp)
+
+    # 4. 将任务加入 FastAPI 后台队列 (立即响应，后台执行)
+    background_tasks.add_task(process_workflow_task, task_id, init_state)
+
+    logger.info(f"Task submitted: {task_id}")
+
+    return {
+        "task_id": task_id,
+        "message": "Task submitted. Poll results at /extract/{task_id}",
+        "status": TaskStatus.PENDING
+    }
+
+
+
+
+
+@app.get("/extract/{task_id}", response_model=TaskResultResponse)
+async def get_extract_result(task_id: str):
+    """
+    [轮询接口] 获取任务执行状态和结果。
+    """
+    task = TASK_STORE.get(task_id)
+
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task ID '{task_id}' not found")
+
+    # === 修复点 ===
+    # TASK_STORE 中存储的是 {"id": "...", ...}
+    # 但 Response Model 期望 {"task_id": "...", ...}
+    # 所以我们需要构造一个新的字典来适配
+    return {
+        "task_id": task.get("id"),  # 将存储中的 'id' 映射给 'task_id'
+        "status": task.get("status"),
+        "submitted_at": task.get("submitted_at"),
+        "completed_at": task.get("completed_at"),
+        "result": task.get("result"),
+        "error": task.get("error")
+    }
 
 
 # --- New dynamic configuration endpoints ---
