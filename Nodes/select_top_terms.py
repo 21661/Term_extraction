@@ -90,13 +90,13 @@ def select_top_terms(state: TermState) -> TermState:
         _reasons)
 
     # 2. 分段并发调用 LLM
-    # 这里的逻辑没问题：每段 8 个词，Prompt 限制 20 个，相当于让 LLM 尽可能保留该段内的有效词
-    chunk_size = min(30, len(candidates) // 3 or 1)
+
+    chunk_size = min(50, len(candidates) // 3 or 1)
     segments = [candidates[i:i + chunk_size] for i in range(0, len(candidates), chunk_size)]
     parsed_results: list[list[str]] = []
 
     try:
-        max_workers = min(20, len(segments))
+        max_workers = min(16, len(segments))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(call_segment, seg, reason, topic) for seg in segments]
             for fut in as_completed(futures):

@@ -44,7 +44,7 @@ def extract_candidates(state: TermState) -> TermState:
     # -----------------------------
     # 3. 去重保留最长版本
     # -----------------------------
-    deduped_terms = filtered_terms
+    deduped_terms = dedupe_keep_longest(filtered_terms)
 
     # -----------------------------
     # 4. 打分

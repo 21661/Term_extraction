@@ -88,7 +88,7 @@ def call_segment(selected_terms: List[str],  topic: str) -> Dict[str, Any]:
 # Reflect 节点
 # ------------------------
 @timed_node()
-def reflect_sync_node(state: TermState, maxRetry: int = 2) -> TermState:
+def reflect_sync_node(state: TermState, maxRetry: int = 1) -> TermState:
     inner, parent, key = _unwrap(state)
     sd: TermState = typing.cast(TermState, inner if isinstance(inner, dict) else TermState())
     reflect_attempts = int(sd.get("reflect_attempts", 0) or 0) + 1
