@@ -26,7 +26,6 @@ def build_reflect_prompt_batch(topic: str, batch_terms: List[str]) -> str:
     prompt = "\n".join([
         f"""
     你现在是术语筛选审查器。你的任务是遵循筛选标准筛选要筛选的词汇表。你必须只返回 JSON，不允许任何注释、解释、自然语言、前缀、后缀。
-    请谨慎的筛选词语，只排除错误明显的词语。
     remove_terms 中违反标准1的词语应排在最前面，依此类推。
 
     【主题】：{topic}
