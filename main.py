@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 import logging
 from utils.db_interface import ensure_db_initialized
-from graph import build_graph
+from graph import build_graph_fast
 from utils.LLMManager import AgentManager, AgentConfigRequestModel, LLMConfigModel, AgentConfigResponseModel
 from utils.LLMClientManager import LLMclientManager
 import uuid
@@ -49,7 +49,7 @@ try:
         ensure_db_initialized()
     except Exception as db_e:
         logger.warning("Database initialization failed at startup: %s", db_e)
-    WORKFLOW = build_graph()
+    WORKFLOW = build_graph_fast()
 except Exception as e:
     logger.exception("Failed to build unified graph at startup: %s", e)
     WORKFLOW = None
@@ -222,7 +222,7 @@ async def update_llm_config(req: UpdateConfigRequest):
         # Attempt to rebuild workflow (optional: if it depends on LLM config)
         rebuilt = False
         try:
-            WORKFLOW = build_graph()
+            WORKFLOW = build_graph_fast()
             rebuilt = WORKFLOW is not None
         except Exception as e:
             logger.warning("Workflow rebuild failed after config update: %s", e)

@@ -10,12 +10,11 @@ from utils.db_interface import query_term_translation
 from utils.LLMClientManager import LLMclientManager
 
 logger = logging.getLogger(__name__)
-
-
-# ==============================================================================
-# 基础工具函数
-# ==============================================================================
-
+def _remove_parenthesis_content(s: str) -> str:
+    if not s:
+        return s
+    # 去除中文括号（）和英文括号()
+    return re.sub(r"（.*?）|\(.*?\)", "", s).strip()
 def _clean_text(text: str) -> str:
     """清洗 LLM 返回的 Markdown 标记"""
     if not text: return ""
@@ -50,13 +49,12 @@ async def translate_term_async(term: str, topic: str = "", model: str = "tencent
 
     # 2. 构造极简 Prompt
     prompt = f"""Target: Translate term to Chinese.
-Context: {topic}
-Term: "{term}"
-Output: JSON list of translations only. No explanations."""
+    Context: {topic}
+    Term: "{term}"
+    Output: JSON list of translations only. No explanations."""
 
     # 3. 异步调用 LLM
     try:
-        # ✅ 修改点：删除了 reasoning=False 参数
         response = await LLMclientManager.achat(
             messages=[
                 {"role": "system", "content": "You are a translator. Return JSON list."},
@@ -67,8 +65,9 @@ Output: JSON list of translations only. No explanations."""
 
         parsed = _parse_json_safe(response.content, list)
         if isinstance(parsed, list):
-            # 简单的后处理，去重
-            return list(set([str(p) for p in parsed if p]))
+            cleaned = [_remove_parenthesis_content(str(p)) for p in parsed if p]
+            cleaned = [c for c in cleaned if c]  # 去掉被清空的
+            return list(set(cleaned))
 
     except Exception as e:
         logger.warning(f"Async translate '{term}' failed: {e}")

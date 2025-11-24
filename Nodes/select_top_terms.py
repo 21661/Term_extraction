@@ -18,11 +18,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ================= 配置区域 =================
-# 批次大小：保持 45，给 LLM 足够的上下文做对比
+
 BATCH_SIZE = 45
-# 并发数
-CONCURRENCY_LIMIT = 32
-# 超时时间
+
+CONCURRENCY_LIMIT = 16
+
 SEGMENT_TIMEOUT = 20
 
 
@@ -93,8 +93,6 @@ async def call_supplement_segment(candidate_pool: list[str], reason: str, topic:
                 await asyncio.sleep(0.5)
 
     return []
-
-
 async def call_segment(seg_terms: list[str], reason: str, topic: str, sem: asyncio.Semaphore) -> list[str]:
     """
     【首次筛选 - 严格模式】
@@ -103,9 +101,55 @@ async def call_segment(seg_terms: list[str], reason: str, topic: str, sem: async
     safe_reason = str(reason)[:200]
 
     prompt = f"""
-    任务：从候选列表中筛选**Top 5%**的核心领域术语。
+    任务：从候选列表中筛选**Top 15%**的核心领域术语。
     主题：{topic}
     排除标准：{safe_reason} (及人名/地名/动词/常用词/非专业词)。
+
+    【原则】：**宁少勿多，宁缺毋滥**。
+    1. 只保留那个领域最不可或缺的专有名词。
+    2. 如果该批次全是普通词汇，请直接返回空数组 []。
+
+    候选：{safe_terms}
+    返回：JSON 字符串数组。
+    """
+
+    async with sem:
+        for attempt in range(1, _LLM_RETRIES + 1):
+            try:
+                completion = await LLMclientManager.achat(
+                    messages=[
+                        {"role": "system", "content": "JSON Generator. Be extremely strict."},
+                        {"role": "user", "content": prompt}
+                    ],
+                )
+                raw = completion.content
+                clean_raw = _clean_json_string(raw)
+                if not clean_raw: continue
+
+                try:
+                    parsed = json.loads(clean_raw)
+                except json.JSONDecodeError:
+                    parsed = json.loads(clean_raw.replace("'", '"'))
+
+                if isinstance(parsed, list):
+                    return [str(p) for p in parsed if isinstance(p, (str, int, float))]
+
+            except Exception as e:
+                logger.debug(f"Segment attempt {attempt} error: {e}")
+                if attempt < _LLM_RETRIES:
+                    await asyncio.sleep(0.5)
+
+    return []
+async def call_segment_FAST(seg_terms: list[str], topic: str, sem: asyncio.Semaphore) -> list[str]:
+    """
+    【首次筛选 - 严格模式】
+    """
+    safe_terms = json.dumps(seg_terms, ensure_ascii=False)
+
+    prompt = f"""
+    任务：从候选列表中筛选**Top 25%**的核心领域术语。
+    主题：{topic}
+    排除标准： 排除人名/地名/动词/常用词/非主题领域的专业词
 
     【原则】：**宁少勿多，宁缺毋滥**。
     1. 只保留那个领域最不可或缺的专有名词。
@@ -157,6 +201,7 @@ async def select_top_terms(state: TermState) -> TermState:
     reflect_attempts = int(sd.get("reflect_attempts", 0) or 0)
 
     remove_list = sd.get("reflect_remove_terms") or []
+    remove_list = remove_list[0:int(len(current_selected) * 0.1)]  # 防止过大
     reason = sd.get("reflect_reason", "")
     topic = sd.get("summary", "")
 
@@ -170,9 +215,8 @@ async def select_top_terms(state: TermState) -> TermState:
 
     remove_norms = {normalize_candidate(t) for t in remove_list if t}
 
-    # =====================================================
-    # 分支 A: 反思补录 (Strict Incremental)
-    # =====================================================
+
+
     if reflect_attempts > 0 and current_selected:
         logger.info(f"Reflect Attempt {reflect_attempts}: Strict Incremental Mode.")
 
@@ -181,43 +225,7 @@ async def select_top_terms(state: TermState) -> TermState:
         for t in current_selected:
             if normalize_candidate(t) not in remove_norms:
                 cleaned_selected.append(t)
-
-        # 2. 寻找极少数的精英替补
-        scored_pool = []
-        existing_norms = {normalize_candidate(t) for t in cleaned_selected}
-        text_lower = str(topic).lower()
-
-        for t in candidates:
-            nk = normalize_candidate(t)
-            if nk and nk not in existing_norms and nk not in remove_norms:
-                # 评分更严格：长度太短的直接低分
-                score = 0
-                if len(t) > 3: score += min(len(t), 10)
-                if t.lower() in text_lower: score += 15  # 必须高度相关
-                if any(c.isupper() for c in t): score += 3  # 专有名词特征
-
-                scored_pool.append((score, t))
-
-        scored_pool.sort(key=lambda x: -x[0])
-        # 宁少勿多：只给 LLM 看分数最高的 40 个，其他的根本不给机会
-        supplement_pool = [t for _, t in scored_pool[:40]]
-
-        # 3. 异步补录
-        new_terms = []
-        if supplement_pool:
-            new_terms = await call_supplement_segment(supplement_pool, reason, topic)
-            logger.info(f"LLM supplemented {len(new_terms)} terms (Strict).")
-
-        # 4. 合并
-        final_list = list(cleaned_selected)
-        existing_final_norms = {normalize_candidate(t) for t in final_list}
-
-        for t in new_terms:
-            nk = normalize_candidate(t)
-            if nk and nk not in existing_final_norms and nk not in remove_norms:
-                original_t = norm_to_original.get(nk, t)
-                final_list.append(original_t)
-                existing_final_norms.add(nk)
+        final_list = cleaned_selected
 
         return _pack_result(final_list, sd.get("term_to_chunks", {}))
 
@@ -276,12 +284,87 @@ async def select_top_terms(state: TermState) -> TermState:
             scored_fb.append((score, t))
         scored_fb.sort(key=lambda x: -x[0])
         # 只取 Top 15
-        final_selected_list = [t for _, t in scored_fb[:15]]
+        final_selected_list = [t for _, t in scored_fb[:50]]
 
     print(f"Async First Pass Selected: {len(final_selected_list)}")
 
     return _pack_result(final_selected_list, sd.get("term_to_chunks", {}))
 
+@timed_node()
+async def select_top_terms_FAST(state: TermState) -> TermState:
+    inner, parent, key = _unwrap(state)
+    sd: TermState = inner if isinstance(inner, dict) else TermState()
+
+    candidates = sd.get("candidates") or []
+    if not candidates:
+        return _pack_result([], {})
+
+    topic = sd.get("summary", "")
+
+    # 1. 建立映射
+    norm_to_original = {}
+    for t in candidates:
+        n = normalize_candidate(t)
+        if n:
+            if n not in norm_to_original or len(t) > len(norm_to_original[n]):
+                norm_to_original[n] = t
+
+
+    logger.info("First pass selection (Strict Mode).")
+    valid_candidates_list = []
+    for n, t in norm_to_original.items():
+        valid_candidates_list.append(t)
+
+    segments = [valid_candidates_list[i:i + BATCH_SIZE] for i in range(0, len(valid_candidates_list), BATCH_SIZE)]
+
+    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    tasks = [asyncio.create_task(call_segment_FAST(seg,topic, sem)) for seg in segments]
+
+    parsed_results = []
+    if tasks:
+        try:
+            async def run_with_timeout(t):
+                try:
+                    return await asyncio.wait_for(t, timeout=SEGMENT_TIMEOUT)
+                except asyncio.TimeoutError:
+                    return []
+                except Exception:
+                    return []
+
+            safe_tasks = [run_with_timeout(t) for t in tasks]
+            results = await asyncio.gather(*safe_tasks)
+            parsed_results = [r for r in results if r]
+        except Exception as e:
+            logger.error(f"Async Gather Error: {e}")
+
+    # 聚合
+    chosen_norms = set()
+    final_selected_list = []
+
+    for seg_res in parsed_results:
+        for item in seg_res:
+            nk = normalize_candidate(item)
+            if nk and nk in norm_to_original and nk not in chosen_norms:
+                chosen_norms.add(nk)
+                final_selected_list.append(norm_to_original[nk])
+
+    # Fallback (宁少勿多：如果实在太少，只补前15个，不再补50个)
+    if len(final_selected_list) < 3:
+        logger.info("Selection critical low, triggering conservative fallback.")
+        scored_fb = []
+        text_lower = str(topic).lower()
+        for t in valid_candidates_list:
+            score = 0
+            if len(t) > 3: score += len(t)
+            if t.lower() in text_lower: score += 20  # 强相关
+            scored_fb.append((score, t))
+        scored_fb.sort(key=lambda x: -x[0])
+        # 只取 Top 15
+        final_selected_list = [t for _, t in scored_fb[:15]]
+
+    print(f"Async First Pass Selected: {len(final_selected_list)}")
+
+    return _pack_result(final_selected_list, sd.get("term_to_chunks", {}))
 
 def _pack_result(selected_terms: list, term_to_chunks: dict) -> TermState:
     """打包结果"""

@@ -3,18 +3,20 @@ import logging
 import asyncio
 import typing
 from typing import List, Dict, Any
+from Nodes.select_top_terms import _pack_result
 
 # 假设你的项目中有这些导入
 from utils.LLMClientManager import LLMclientManager
 from utils.TermState import TermState
 from utils.TimeNode import timed_node
 from utils.workflow_adapter import _unwrap
-from utils.candidate_tool import _LLM_RETRIES, _RETRY_BACKOFF
+from utils.candidate_tool import _LLM_RETRIES, _RETRY_BACKOFF, normalize_candidate
 
 logger = logging.getLogger(__name__)
 
 # 配置参数
-BATCH_SIZE = 60  # 每批处理30个词，平衡并发数和Token长度
+BATCH_SIZE = 40  # 每批处理40个词，平衡并发数和Token长度
+BATCH_SIZE_F = 100
 
 
 # ------------------------
@@ -55,15 +57,13 @@ def build_reflect_prompt_batch(topic: str, batch_terms: List[str]) -> str:
 # ------------------------
 # 异步单个批次处理
 # ------------------------
-async def process_batch(batch_terms: List[str], topic: str, batch_index: int) -> Dict[str, Any]:
+async def process_batch(batch_terms: List[str], topic: str, batch_index: int,prompt:str) -> Dict[str, Any]:
     """
     异步处理单个批次，包含重试逻辑
     """
     raw = None
     for attempt in range(1, _LLM_RETRIES + 1):
         try:
-            prompt = build_reflect_prompt_batch(topic, batch_terms)
-
             # 使用异步接口 achat
             # 建议开启 reasoning=False 以获得更快的速度，除非你需要强推理
             completion = await LLMclientManager.achat(
@@ -149,7 +149,7 @@ async def reflect_sync_node(state: TermState, maxRetry: int = 1) -> TermState:
     chunks = [target_terms[i:i + BATCH_SIZE] for i in range(0, len(target_terms), BATCH_SIZE)]
 
     for i, chunk in enumerate(chunks):
-        tasks.append(process_batch(chunk, topic, i))
+        tasks.append(process_batch(chunk, topic, i,build_reflect_prompt_batch(topic, chunk)))
 
     # 5. 并发执行并等待所有结果
     # asyncio.gather 会并发运行所有任务

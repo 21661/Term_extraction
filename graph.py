@@ -13,7 +13,8 @@ from utils.TimeNode import timed_node
 import typing
 from utils.TermState import TermState
 from Nodes._reflect_node import reflect_sync_node,route_after_reflect
-from Nodes.select_top_terms import select_top_terms
+from Nodes._remove_node import remove_sync_node
+from Nodes.select_top_terms import select_top_terms,select_top_terms_FAST
 from Nodes._terms_only_batch import _terms_only_batch
 
 # ===================== 2️⃣ 初始化 =====================
@@ -253,6 +254,35 @@ def build_graph() -> Runnable:
             "proceed": "aggregate_unique_terms",
         },
     )
+
+    graph.add_edge("aggregate_unique_terms", "batch_translate")
+
+    graph.add_edge("batch_translate", "assemble_annotations")
+
+    graph.add_edge("assemble_annotations", END)
+
+    return graph.compile()
+@timed_node()
+def build_graph_fast() -> Runnable:
+    graph: StateGraph[TermState] = StateGraph(TermState)
+
+    graph.add_node("init", _init_extract_state)
+    graph.add_node("terms_only_batch", _terms_only_batch)
+    graph.add_node("select_top_terms", select_top_terms_FAST)
+
+    graph.add_node("aggregate_unique_terms", _aggregate_unique_terms)
+
+    graph.add_node("batch_translate", _single_translate_concurrent)
+
+    graph.add_node("assemble_annotations", _assemble_annotations)
+
+
+    graph.set_entry_point("init")
+
+    graph.add_edge("init", "terms_only_batch")
+
+    graph.add_edge("terms_only_batch", "select_top_terms")
+    graph.add_edge("select_top_terms","aggregate_unique_terms")
 
     graph.add_edge("aggregate_unique_terms", "batch_translate")
 
